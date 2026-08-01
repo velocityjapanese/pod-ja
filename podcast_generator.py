@@ -161,11 +161,9 @@ def draw_person_icon(draw, center_x, center_y):
 def draw_japanese_flag(img, draw, center_x, center_y, radius=22):
     flag_img = Image.new('RGBA', (radius*2, radius*2), (0, 0, 0, 0))
     fdraw = ImageDraw.Draw(flag_img)
-    # Japanese flag: Black top (33%), Red middle (33%), Gold bottom (33%)
-    h = radius * 2
-    fdraw.rectangle([(0, 0), (radius*2, int(h * 0.33))], fill=(0, 0, 0, 255))
-    fdraw.rectangle([(0, int(h * 0.33)), (radius*2, int(h * 0.66))], fill=(221, 0, 0, 255))
-    fdraw.rectangle([(0, int(h * 0.66)), (radius*2, h)], fill=(255, 204, 0, 255))
+    # Japanese flag: white background with red sun circle
+    fdraw.rectangle([(0, 0), (radius*2, radius*2)], fill=(255, 255, 255, 255))
+    fdraw.ellipse([(int(radius*0.6), int(radius*0.6)), (int(radius*1.4), int(radius*1.4))], fill=(188, 0, 45, 255))
     
     mask = Image.new('L', (radius*2, radius*2), 0)
     mdraw = ImageDraw.Draw(mask)
@@ -372,21 +370,34 @@ def create_frame(turn, output_path, frame_num=0):
                 tmp_lines[-1] = tmp_lines[-1].rstrip() + "..."
         final_lines = tmp_lines
         japanese_text = " ".join(final_lines)
-    draw_rich_text_centered(draw, japanese_text, center_y=390, font=chosen_font, max_w=1550, line_height=chosen_lh)
 
-    # === ROMAJI (English transliteration) ===
+    # === DYNAMIC LAYOUT: language top, romaji middle, divider, english bottom ===
+    n_ja_lines = max(1, len(final_lines))
+    # Start Japanese text high, grow downward with line count
+    ja_center = 260 + (n_ja_lines - 1) * (chosen_lh // 2)
+    draw_rich_text_centered(draw, japanese_text, center_y=ja_center, font=chosen_font, max_w=1550, line_height=chosen_lh)
+
+    # Romaji directly below the Japanese block
+    ja_bottom = ja_center + n_ja_lines * chosen_lh // 2
     romaji_text = turn.get("romaji", "")
+    romaji_center = None
     if romaji_text:
-        draw_english_translation(draw, romaji_text, center_y=570, font=f_english, max_w=1350, line_height=48)
+        romaji_lines = max(1, len(romaji_text.split()) // 18 + 1)
+        romaji_center = ja_bottom + 20 + (romaji_lines * 26)
+        draw_english_translation(draw, romaji_text, center_y=romaji_center, font=f_english, max_w=1350, line_height=44)
 
-    # === CENTER DIVIDER WITH DOT ===
-    div_y = 660
+    # Dynamic divider between language section and English section
+    if romaji_center is not None:
+        div_y = min(romaji_center + 60, 720)
+    else:
+        div_y = min(ja_bottom + 40, 720)
     draw.line([(VIDEO_WIDTH//2 - 300, div_y), (VIDEO_WIDTH//2 + 300, div_y)], fill=YELLOW, width=2)
     draw.ellipse([(VIDEO_WIDTH//2 - 8, div_y - 8), (VIDEO_WIDTH//2 + 8, div_y + 8)], fill=YELLOW)
 
-    # === ENGLISH TRANSLATION ===
+    # English translation anchored between divider and footer
     english_text = turn.get("english", "")
-    draw_english_translation(draw, english_text, center_y=715, font=f_english, max_w=1350, line_height=52)
+    eng_center = (div_y + 975) // 2
+    draw_english_translation(draw, english_text, center_y=eng_center, font=f_english, max_w=1350, line_height=46)
 
     # === BOTTOM FOOTER ===
     draw.line([(0, 975), (VIDEO_WIDTH, 975)], fill=YELLOW, width=2)
@@ -425,7 +436,7 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural Japanese. Include romaji (English transliteration) for every Japanese line. NO filler sounds.
-IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "Wir schauen in die **Zukunft**."
+IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "\u79c1\u305f\u3061\u306f**\u672a\u6765**\u3092\u898b\u307e\u3059\u3002"
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "japanese" (Japanese text), "romaji" (English transliteration of the Japanese), and "english" (English translation):
 [{{"speaker": "{current_host}", "japanese": "...", "romaji": "...", "english": "..."}},
@@ -436,7 +447,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": AI_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **Wort**. No filler sounds."},
+                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.9
