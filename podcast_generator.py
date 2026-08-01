@@ -90,6 +90,33 @@ def load_font(size, bold=False, italic=False):
             except: continue
     return ImageFont.load_default()
 
+def load_japanese_font(size, bold=False):
+    """Load a font that supports Japanese characters (kana + kanji)."""
+    if bold:
+        candidates = [
+            str(FONTS_DIR / "NotoSansJP-Bold.ttf"),
+            "C:/Windows/Fonts/YuGothB.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Bold.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        ]
+    else:
+        candidates = [
+            str(FONTS_DIR / "NotoSansJP-Regular.ttf"),
+            "C:/Windows/Fonts/YuGothM.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ]
+    for fp in candidates:
+        if Path(fp).exists():
+            try: return ImageFont.truetype(fp, size)
+            except: continue
+    # fallback to the bundled DejaVu (will show boxes but not crash)
+    return load_font(size, bold=bold)
+
 def clean_text(text):
     text = re.sub(r'\b(mm+|um+|uh+|ah+|äh+)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -254,7 +281,7 @@ def create_frame(turn, output_path, frame_num=0):
     f_ep = load_font(22, bold=True)
     f_speaker = load_font(26, bold=True)
     f_hablando = load_font(24, bold=False)
-    f_japanese = load_font(64, bold=True)
+    f_japanese = load_japanese_font(64, bold=True)
     f_english = load_font(42, bold=False, italic=True)
     f_footer = load_font(22, bold=False)
 
@@ -265,8 +292,8 @@ def create_frame(turn, output_path, frame_num=0):
     draw.text((110, header_y), "VELOCITY", fill=WHITE, font=f_title_white, anchor="lm")
     v_bbox = draw.textbbox((110, header_y), "VELOCITY", font=f_title_white, anchor="lm")
     
-    draw.text((v_bbox[2] + 8, header_y), "GERMAN", fill=YELLOW, font=f_title_white, anchor="lm")
-    s_bbox = draw.textbbox((v_bbox[2] + 8, header_y), "GERMAN", font=f_title_white, anchor="lm")
+    draw.text((v_bbox[2] + 8, header_y), "JAPANESE", fill=YELLOW, font=f_title_white, anchor="lm")
+    s_bbox = draw.textbbox((v_bbox[2] + 8, header_y), "JAPANESE", font=f_title_white, anchor="lm")
 
     draw.text((s_bbox[2] + 8, header_y), "PODCAST", fill=WHITE, font=f_title_white, anchor="lm")
     p_bbox = draw.textbbox((s_bbox[2] + 8, header_y), "PODCAST", font=f_title_white, anchor="lm")
@@ -305,7 +332,7 @@ def create_frame(turn, output_path, frame_num=0):
     chosen_lh = 90
     final_lines = []
     for test_size in [64, 56, 48, 40, 34, 28, 24, 20]:
-        test_font = load_font(test_size, bold=True)
+        test_font = load_japanese_font(test_size, bold=True)
         test_lh = int(test_size * 1.4)
         text_words = japanese_text.split()
         tmp_lines = []
@@ -325,7 +352,7 @@ def create_frame(turn, output_path, frame_num=0):
             final_lines = tmp_lines
             break
     if chosen_font is None:
-        chosen_font = load_font(20, bold=True)
+        chosen_font = load_japanese_font(20, bold=True)
         chosen_lh = int(20 * 1.4)
         text_words = japanese_text.split()
         tmp_lines = []
@@ -504,11 +531,13 @@ def generate_script():
 
     # Short 2-line intro: Kenji (Host2) first, then Hana (Host1), then topic
     all_turns[0]["speaker"] = "Host2"
-    all_turns[0]["japanese"] = f"こんにちは、健二です。Konnichiwa, Kenji desu.. Velocity Japanese へようこそ。Yōkoso.. 今日はについて話します。Kyō wa {topic_es}."
+    all_turns[0]["japanese"] = f"こんにちは、健二です。Velocity Japanese へようこそ。今日は{topic_es}について話します。"
+    all_turns[0]["romaji"] = f"Konnichiwa, Kenji desu. Velocity Japanese e yōkoso. Kyō wa {topic_es} ni tsuite hanashimasu."
     all_turns[0]["english"] = f"Hi, I'm Kenji. Welcome to Velocity Japanese Podcast. Today we talk about {topic_en}."
     if len(all_turns) > 1:
         all_turns[1]["speaker"] = "Host1"
-        all_turns[1]["japanese"] = f"ありがとう、健二さん。Arigatō, Kenji-san.. 今日のテーマはとても**面白い**です。始めましょう。Hajimemashō.."
+        all_turns[1]["japanese"] = f"ありがとう、健二さん。今日のテーマはとても**面白い**です。始めましょう。"
+        all_turns[1]["romaji"] = f"Arigatō, Kenji-san. Kyō no tēma wa totemo **omoshiroi** desu. Hajimemashō."
         all_turns[1]["english"] = f"Thanks, Kenji. Today's topic is very interesting. Let's start."
 
     print(f"  Script: {len(all_turns)} turns, topic: {topic_es}")
@@ -520,9 +549,9 @@ def _fallback_script(topic_es, topic_en):
     for i in range(150):
         s = "Host2" if i % 2 == 0 else "Host1"
         if s == "Host2":
-            turns.append({"speaker": s, "japanese": f"こんにちは、健二です。Konnichiwa, Kenji desu.. Sprechen wir über die **Zukunft** und über {topic_es}.", "english": f"Hi, I'm Kenji. Let's talk about the future and {topic_en}."})
+            turns.append({"speaker": s, "japanese": f"こんにちは、健二です。今日は{topic_es}について話します。", "romaji": f"Konnichiwa, Kenji desu. Kyou wa {topic_es} ni tsuite hanashimasu.", "english": f"Hi, I'm Kenji. Today we talk about {topic_en}."})
         else:
-            turns.append({"speaker": s, "japanese": f"Gute Idee Kenji. {topic_es} ist sehr **interessant**.", "english": f"Good idea Kenji. {topic_en} is very interesting."})
+            turns.append({"speaker": s, "japanese": f"いいですね、健二さん。{topic_es}はとても**面白い**です。", "romaji": f"Ii desu ne, Kenji-san. {topic_es} wa totemo **omoshiroi** desu.", "english": f"Good idea, Kenji. {topic_en} is very interesting."})
     return turns
 
 
@@ -606,7 +635,7 @@ def create_video(turns, audio_files, video_dir=None):
 
 async def main():
     print("=" * 60)
-    print("  VELOCITY GERMAN PODCAST")
+    print("  VELOCITY JAPANESE PODCAST")
     print("=" * 60)
 
     print("\n[1/4] Generating script (150 turns)...")
