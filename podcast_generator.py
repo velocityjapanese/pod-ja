@@ -299,11 +299,12 @@ def create_frame(turn, output_path, frame_num=0):
 
     draw.text((pill_x + pill_w + 25, pill_y + 26), "hanashite imasu", fill=LIGHT_GRAY, font=f_hablando, anchor="lm")
 
-    # === MAIN TEXT (auto-size to fit max 3 lines) ===
+    # === MAIN TEXT (auto-size, HARD max 3 lines) ===
     japanese_text = turn.get("japanese", turn.get("spanish", ""))
-    chosen_font = f_japanese
+    chosen_font = None
     chosen_lh = 90
-    for test_size in [64, 56, 48, 40, 34]:
+    final_lines = []
+    for test_size in [64, 56, 48, 40, 34, 28, 24, 20]:
         test_font = load_font(test_size, bold=True)
         test_lh = int(test_size * 1.4)
         text_words = japanese_text.split()
@@ -318,10 +319,32 @@ def create_frame(turn, output_path, frame_num=0):
                 tmp_lines.append(' '.join(cur))
                 cur = [w]
         if cur: tmp_lines.append(' '.join(cur))
-        if len(tmp_lines) <= 3 or test_size <= 34:
+        if len(tmp_lines) <= 3:
             chosen_font = test_font
             chosen_lh = test_lh
+            final_lines = tmp_lines
             break
+    if chosen_font is None:
+        chosen_font = load_font(20, bold=True)
+        chosen_lh = int(20 * 1.4)
+        text_words = japanese_text.split()
+        tmp_lines = []
+        cur = []
+        for w in text_words:
+            test = ' '.join(cur + [w])
+            bb = draw.textbbox((0, 0), test, font=chosen_font)
+            if bb[2] - bb[0] <= 1550 or not cur:
+                cur.append(w)
+            else:
+                tmp_lines.append(' '.join(cur))
+                cur = [w]
+        if cur: tmp_lines.append(' '.join(cur))
+        if len(tmp_lines) > 3:
+            tmp_lines = tmp_lines[:3]
+            if japanese_text:
+                tmp_lines[-1] = tmp_lines[-1].rstrip() + "..."
+        final_lines = tmp_lines
+        japanese_text = " ".join(final_lines)
     draw_rich_text_centered(draw, japanese_text, center_y=390, font=chosen_font, max_w=1550, line_height=chosen_lh)
 
     # === ROMAJI (English transliteration) ===
