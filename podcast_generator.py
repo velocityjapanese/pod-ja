@@ -122,6 +122,45 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def sanitize_latin(text):
+    """Convert leaked non-Latin characters to font-safe Latin equivalents so
+    romaji/English never show tofu glyphs. Handles macrons, full-width forms
+    and Japanese punctuation."""
+    if not text:
+        return text
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = text.replace('\u2019', "'").replace('\u2018', "'")
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    text = text.replace('\u2026', '...').replace('\u2014', ' - ').replace('\u2013', ' - ')
+    text = text.replace('\u3001', ', ').replace('\u3002', '.').replace('\u30fb', ' ')
+    text = text.replace('\uff0c', ',').replace('\uff0e', '.').replace('\uff01', '!')
+    text = text.replace('\uff1f', '?').replace('\uff20', '@')
+    def norm_letter(m):
+        ch = m.group(0)
+        if ch == '\u0101': return 'a'
+        if ch == '\u014d': return 'o'
+        if ch == '\u016b': return 'u'
+        if ch == '\u012b': return 'i'
+        if ch == '\u0113': return 'e'
+        if ch == '\u0100': return 'A'
+        if ch == '\u014c': return 'O'
+        if ch == '\u016a': return 'U'
+        if ch == '\u012a': return 'I'
+        if ch == '\u0112': return 'E'
+        if ch == '\u00e9': return 'e'
+        if ch == '\u00e8': return 'e'
+        if ch == '\u00ea': return 'e'
+        if ch == '\u00ef': return 'i'
+        if ch == '\u00f1': return 'n'
+        if ch == '\u00fc': return 'u'
+        if ch == '\u00f6': return 'o'
+        if ch == '\u00e4': return 'a'
+        return ch
+    text = re.sub(r'[\u00c0-\u024f\u0100-\u017f]', norm_letter, text)
+    text = re.sub(r'[\u3040-\u30ff\u4e00-\u9fff\uff00-\uffef\u3000-\u303f]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 def auto_highlight_japanese(text):
     if '**' in text:
         return text
@@ -344,7 +383,7 @@ def create_frame(turn, output_path, frame_num=0):
     ZONE_BOTTOM = DIV_Y - 30
     ZONE_H = ZONE_BOTTOM - ZONE_TOP
     japanese_text = turn.get("japanese", turn.get("spanish", ""))
-    romaji_text = turn.get("romaji", "")
+    romaji_text = sanitize_latin(turn.get("romaji", ""))
 
     def _wrap(text, font, max_w):
         tokens = _cjk_tokens(text, font, draw)
@@ -410,7 +449,7 @@ def create_frame(turn, output_path, frame_num=0):
     draw.ellipse([(VIDEO_WIDTH//2 - 8, div_y - 8), (VIDEO_WIDTH//2 + 8, div_y + 8)], fill=YELLOW)
 
     # === ENGLISH TRANSLATION (ITALIC, WRAPPED) ===
-    english_text = turn.get("english", "")
+    english_text = sanitize_latin(turn.get("english", ""))
     draw_english_translation(draw, english_text, center_y=715, font=f_english, max_w=1350, line_height=48)
 
     # === BOTTOM FOOTER ===
