@@ -158,6 +158,19 @@ def sanitize_latin(text):
         return ch
     text = re.sub(r'[\u00c0-\u024f\u0100-\u017f]', norm_letter, text)
     text = re.sub(r'[\u3040-\u30ff\u4e00-\u9fff\uff00-\uffef\u3000-\u303f]', ' ', text)
+    # final safety net: map remaining symbols to ASCII, else drop (prevents any tofu glyph)
+    text = text.replace('\u2192', ' -> ').replace('\u2190', ' <- ').replace('\u2194', ' -- ')
+    text = text.replace('\u2022', '-').replace('\u25cf', '-').replace('\u2605', '*').replace('\u2606', '*')
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if 0x20 <= o <= 0x7E:
+            out.append(ch)
+        elif o in (0x0A, 0x0D):
+            out.append(' ')
+        else:
+            out.append(' ')
+    text = ''.join(out)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
