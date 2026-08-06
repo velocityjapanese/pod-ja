@@ -176,48 +176,56 @@ def draw_headphones_icon(draw, center_x, center_y):
     draw.rounded_rectangle([center_x - 16, center_y - 3, center_x - 10, center_y + 11], radius=2, fill=YELLOW)
     draw.rounded_rectangle([center_x + 10, center_y - 3, center_x + 16, center_y + 11], radius=2, fill=YELLOW)
 
-def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=90):
-    text = auto_highlight_japanese(text)
+def _cjk_tokens(text, font, draw):
+    """Split text into drawable tokens (char-level for CJK, word-level for latin),
+    each tagged with whether it belongs to a highlighted (**) segment."""
     pattern = r'(\*\*.*?\*\*)'
     raw_parts = re.split(pattern, text)
     tokens = []
     for part in raw_parts:
         if part.startswith('**') and part.endswith('**'):
-            tokens.append((part[2:-2], True))
+            is_hl = True
+            part = part[2:-2]
         elif part:
-            tokens.append((part, False))
-            
-    words_with_status = []
-    for text_chunk, is_yellow in tokens:
-        words = text_chunk.split(' ')
-        for i, w in enumerate(words):
-            if w:
-                words_with_status.append((w, is_yellow))
-            if i < len(words) - 1:
-                words_with_status.append((' ', False))
+            is_hl = False
+        else:
+            continue
+        if re.search(r'[\u3000-\u30ff\u4e00-\u9fff]', part):
+            for ch in part:
+                bb = draw.textbbox((0, 0), ch, font=font)
+                tokens.append((ch, is_hl, bb[2] - bb[0]))
+        else:
+            for w in part.split(' '):
+                if not w:
+                    continue
+                bb = draw.textbbox((0, 0), w, font=font)
+                tokens.append((w, is_hl, bb[2] - bb[0]))
+                tokens.append((' ', False, draw.textbbox((0, 0), ' ', font=font)[2]))
+            if tokens and tokens[-1][0] == ' ':
+                tokens.pop()
+    return tokens
 
+def _wrap_tokens(tokens, max_w):
+    """Greedy wrap tokens into visual lines that each fit max_w."""
     lines = []
     current_line = []
     current_line_width = 0
 
-    for item in words_with_status:
-        word, is_yellow = item
-        w_bbox = draw.textbbox((0, 0), word, font=font)
-        w_width = w_bbox[2] - w_bbox[0]
-
-        if current_line_width + w_width <= max_w or not current_line:
-            current_line.append((word, is_yellow, w_width))
+    for word, is_hl, w_width in tokens:
+        if current_line_width + w_width <= max_w:
+            current_line.append((word, is_hl, w_width))
             current_line_width += w_width
         else:
-            if current_line and current_line[-1][0] == ' ':
-                current_line_width -= current_line[-1][2]
-                current_line.pop()
-            lines.append((current_line, current_line_width))
+            if current_line:
+                if current_line[-1][0] == ' ':
+                    current_line_width -= current_line[-1][2]
+                    current_line.pop()
+                lines.append((current_line, current_line_width))
             if word == ' ':
                 current_line = []
                 current_line_width = 0
             else:
-                current_line = [(word, is_yellow, w_width)]
+                current_line = [(word, is_hl, w_width)]
                 current_line_width = w_width
 
     if current_line:
@@ -225,6 +233,12 @@ def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=
             current_line_width -= current_line[-1][2]
             current_line.pop()
         lines.append((current_line, current_line_width))
+    return lines
+
+def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=90):
+    text = auto_highlight_japanese(text)
+    tokens = _cjk_tokens(text, font, draw)
+    lines = _wrap_tokens(tokens, max_w)
 
     total_height = len(lines) * line_height
     start_y = center_y - total_height // 2
@@ -324,64 +338,71 @@ def create_frame(turn, output_path, frame_num=0):
 
     draw.text((pill_x + pill_w + 25, pill_y + 26), "hanashite imasu", fill=LIGHT_GRAY, font=f_hablando, anchor="lm")
 
-    # === MAIN TEXT (auto-size, HARD max 3 lines) ===
+    # === MAIN TEXT ZONE: Japanese + Romaji, must BOTH fit above the center divider ===
+    ZONE_TOP = 300
+    DIV_Y = 615
+    ZONE_BOTTOM = DIV_Y - 30
+    ZONE_H = ZONE_BOTTOM - ZONE_TOP
     japanese_text = turn.get("japanese", turn.get("spanish", ""))
-    chosen_font = None
-    chosen_lh = 90
+    romaji_text = turn.get("romaji", "")
+
+    def _wrap(text, font, max_w):
+        tokens = _cjk_tokens(text, font, draw)
+        wrapped = _wrap_tokens(tokens, max_w)
+        return [' '.join(w for w, hl, ww in line).strip() for line, wd in wrapped]
+
+    # 1) choose the largest Japanese font that wraps into <= 3 lines
+    ja_font = None
+    ja_size = 64
     final_lines = []
     for test_size in [64, 56, 48, 40, 34, 28, 24, 20]:
-        test_font = load_japanese_font(test_size, bold=True)
-        test_lh = int(test_size * 1.4)
-        text_words = japanese_text.split()
-        tmp_lines = []
-        cur = []
-        for w in text_words:
-            test = ' '.join(cur + [w])
-            bb = draw.textbbox((0, 0), test, font=test_font)
-            if bb[2] - bb[0] <= 1550 or not cur:
-                cur.append(w)
-            else:
-                tmp_lines.append(' '.join(cur))
-                cur = [w]
-        if cur: tmp_lines.append(' '.join(cur))
-        if len(tmp_lines) <= 3:
-            chosen_font = test_font
-            chosen_lh = test_lh
-            final_lines = tmp_lines
+        tf = load_japanese_font(test_size, bold=True)
+        tl = _wrap(japanese_text, tf, 1550)
+        if len(tl) <= 3:
+            ja_font, ja_size, final_lines = tf, test_size, tl
             break
-    if chosen_font is None:
-        chosen_font = load_japanese_font(20, bold=True)
-        chosen_lh = int(20 * 1.4)
-        text_words = japanese_text.split()
-        tmp_lines = []
-        cur = []
-        for w in text_words:
-            test = ' '.join(cur + [w])
-            bb = draw.textbbox((0, 0), test, font=chosen_font)
-            if bb[2] - bb[0] <= 1550 or not cur:
-                cur.append(w)
-            else:
-                tmp_lines.append(' '.join(cur))
-                cur = [w]
-        if cur: tmp_lines.append(' '.join(cur))
-        if len(tmp_lines) > 3:
-            tmp_lines = tmp_lines[:3]
-            if japanese_text:
-                tmp_lines[-1] = tmp_lines[-1].rstrip() + "..."
-        final_lines = tmp_lines
-        japanese_text = " ".join(final_lines)
+    if ja_font is None:
+        ja_font, ja_size = load_japanese_font(20, bold=True), 20
+        all_lines = _wrap(japanese_text, ja_font, 1550)
+        final_lines = all_lines[:3]
+        if len(all_lines) > 3 and japanese_text:
+            final_lines[-1] = final_lines[-1].rstrip() + "..."
+    n_ja = len(final_lines)
 
-    # === MAIN JAPANESE TEXT (compact, matches other podcasts) ===
-    n_ja_lines = max(1, len(final_lines))
-    ja_center = 400 + (n_ja_lines - 1) * (chosen_lh // 2)
-    draw_rich_text_centered(draw, japanese_text, center_y=ja_center, font=chosen_font, max_w=1550, line_height=chosen_lh)
+    # 2) wrap romaji at the starting italic size
+    ro_size = 40
+    ro_lines = _wrap(romaji_text, f_english, 1350) if romaji_text else []
+    n_ro = len(ro_lines)
 
-    # === ROMAJI (English transliteration) - directly below Japanese ===
-    romaji_text = turn.get("romaji", "")
-    if romaji_text:
-        romaji_lines = max(1, len(romaji_text.split()) // 22 + 1)
-        romaji_center = ja_center + n_ja_lines * chosen_lh // 2 + 30 + (romaji_lines * 24)
-        draw_english_translation(draw, romaji_text, center_y=romaji_center, font=f_english, max_w=1350, line_height=40)
+    # 3) dynamically shrink BOTH fonts until the block fits inside the zone
+    ja_lh = int(ja_size * 1.4)
+    ro_lh = 52
+    while True:
+        block_h = n_ja * ja_lh + (30 if n_ro else 0) + n_ro * ro_lh
+        if block_h <= ZONE_H or ja_size <= 20:
+            break
+        ja_size = max(20, ja_size - 2)
+        ro_size = max(18, ro_size - 1)
+        ja_font = load_japanese_font(ja_size, bold=True)
+        ro_font = load_font(ro_size, bold=False, italic=True)
+        final_lines = _wrap(japanese_text, ja_font, 1550)
+        n_ja = len(final_lines)
+        ro_lines = _wrap(romaji_text, ro_font, 1350) if romaji_text else []
+        n_ro = len(ro_lines)
+        ja_lh = int(ja_size * 1.4)
+        ro_lh = int(ro_size * 1.3)
+
+    # 4) center the whole block vertically inside the zone
+    block_h = n_ja * ja_lh + (30 if n_ro else 0) + n_ro * ro_lh
+    block_top = ZONE_TOP + (ZONE_H - block_h) // 2
+    ja_center = block_top + n_ja * ja_lh // 2
+    draw_rich_text_centered(draw, " ".join(final_lines), center_y=ja_center,
+                            font=ja_font, max_w=1550, line_height=ja_lh)
+    if n_ro:
+        ro_center = block_top + n_ja * ja_lh + 30 + n_ro * ro_lh // 2
+        ro_font = load_font(ro_size, bold=False, italic=True)
+        draw_english_translation(draw, " ".join(ro_lines), center_y=ro_center,
+                                 font=ro_font, max_w=1350, line_height=ro_lh)
 
     # === CENTER DIVIDER WITH DOT ===
     div_y = 615
