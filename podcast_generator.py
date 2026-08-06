@@ -371,37 +371,26 @@ def create_frame(turn, output_path, frame_num=0):
         final_lines = tmp_lines
         japanese_text = " ".join(final_lines)
 
-    # === DYNAMIC LAYOUT: language top, romaji middle, divider, english bottom ===
+    # === MAIN JAPANESE TEXT (compact, matches other podcasts) ===
     n_ja_lines = max(1, len(final_lines))
-    # English translation is ALWAYS anchored near the footer (never overlaps)
-    english_text = turn.get("english", "")
-    eng_lines_est = max(1, len(english_text.split()) // 16 + 1)
-    eng_center = 920 - (eng_lines_est * 23)
-    draw_english_translation(draw, english_text, center_y=eng_center, font=f_english, max_w=1300, line_height=44)
-
-    # Japanese text: top area, with space based on line count (min 2, max 3 lines)
-    ja_center = 250 + (n_ja_lines - 1) * (chosen_lh // 2)
+    ja_center = 400 + (n_ja_lines - 1) * (chosen_lh // 2)
     draw_rich_text_centered(draw, japanese_text, center_y=ja_center, font=chosen_font, max_w=1550, line_height=chosen_lh)
-    ja_bottom = ja_center + n_ja_lines * chosen_lh // 2
 
-    # Romaji clearly below Japanese with a gap
+    # === ROMAJI (English transliteration) - directly below Japanese ===
     romaji_text = turn.get("romaji", "")
-    romaji_center = None
     if romaji_text:
-        romaji_lines = max(1, len(romaji_text.split()) // 18 + 1)
-        romaji_center = ja_bottom + 25 + (romaji_lines * 24)
-        draw_english_translation(draw, romaji_text, center_y=romaji_center, font=f_english, max_w=1350, line_height=42)
+        romaji_lines = max(1, len(romaji_text.split()) // 22 + 1)
+        romaji_center = ja_center + n_ja_lines * chosen_lh // 2 + 30 + (romaji_lines * 24)
+        draw_english_translation(draw, romaji_text, center_y=romaji_center, font=f_english, max_w=1350, line_height=40)
 
-    # Divider placed between language section and English section with guaranteed gaps
-    if romaji_center is not None:
-        div_y = romaji_center + 35
-    else:
-        div_y = ja_bottom + 30
-    # Cap so it never hits the English translation (which is above footer at ~eng_center)
-    max_div = eng_center - 50
-    div_y = max(400, min(div_y, max_div))
+    # === CENTER DIVIDER WITH DOT ===
+    div_y = 615
     draw.line([(VIDEO_WIDTH//2 - 300, div_y), (VIDEO_WIDTH//2 + 300, div_y)], fill=YELLOW, width=2)
     draw.ellipse([(VIDEO_WIDTH//2 - 8, div_y - 8), (VIDEO_WIDTH//2 + 8, div_y + 8)], fill=YELLOW)
+
+    # === ENGLISH TRANSLATION (ITALIC, WRAPPED) ===
+    english_text = turn.get("english", "")
+    draw_english_translation(draw, english_text, center_y=715, font=f_english, max_w=1350, line_height=48)
 
     # === BOTTOM FOOTER ===
     draw.line([(0, 975), (VIDEO_WIDTH, 975)], fill=YELLOW, width=2)
