@@ -294,6 +294,8 @@ def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=
 
     total_height = len(lines) * line_height
     start_y = center_y - total_height // 2
+    ink_min_top = None
+    ink_max = None
 
     for line_idx, (line_words, line_w) in enumerate(lines):
         start_x = (VIDEO_WIDTH - line_w) // 2
@@ -303,7 +305,29 @@ def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=
         for word, is_yellow, w_w in line_words:
             color = YELLOW if is_yellow else WHITE
             draw.text((curr_x, curr_y), word, fill=color, font=font)
+            bb = draw.textbbox((curr_x, curr_y), word, font=font)
+            ink_min_top = min(ink_min_top, bb[1]) if ink_min_top is not None else bb[1]
+            ink_max = max(ink_max, bb[3]) if ink_max is not None else bb[3]
             curr_x += w_w
+
+    if ink_min_top is None:
+        ink_min_top = start_y
+        ink_max = start_y + total_height
+    return ink_min_top, ink_max
+
+def _ro_ink_height(font, lines, max_w=1350):
+    """Return the measured ink height of the given (already-wrapped) latin lines."""
+    from PIL import Image, ImageDraw
+    if not lines:
+        return 0
+    tmp = Image.new('RGB', (max_w, 200), (0, 0, 0))
+    td = ImageDraw.Draw(tmp)
+    probe = lines[0]
+    bb = td.textbbox((0, 0), probe, font=font)
+    h = bb[3] - bb[1]
+    if len(lines) > 1:
+        h += (len(lines) - 1) * int(font.size * 1.3)
+    return h
 
 def draw_english_translation(draw, text, center_y, font, max_w=1350, line_height=52):
     words = text.split()
@@ -324,10 +348,20 @@ def draw_english_translation(draw, text, center_y, font, max_w=1350, line_height
         
     total_h = len(lines) * line_height
     start_y = center_y - total_h // 2
-    
+
+    ink_min_top = None
+    ink_max = None
     for idx, line in enumerate(lines):
-        draw.text((VIDEO_WIDTH // 2, start_y + idx * line_height + line_height // 2),
-                  line, fill=LIGHT_GRAY, font=font, anchor="mm")
+        lx = VIDEO_WIDTH // 2
+        ly = start_y + idx * line_height + line_height // 2
+        draw.text((lx, ly), line, fill=LIGHT_GRAY, font=font, anchor="mm")
+        bb = draw.textbbox((lx, ly), line, font=font, anchor="mm")
+        ink_min_top = bb[1] if ink_min_top is None else min(ink_min_top, bb[1])
+        ink_max = bb[3] if ink_max is None else max(ink_max, bb[3])
+    if ink_min_top is None:
+        ink_min_top = start_y
+        ink_max = start_y + total_h
+    return ink_min_top, ink_max
 
 def create_frame(turn, output_path, frame_num=0):
     img = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), DARK_BG)
@@ -426,11 +460,14 @@ def create_frame(turn, output_path, frame_num=0):
     ro_lines = _wrap(romaji_text, f_english, 1350) if romaji_text else []
     n_ro = len(ro_lines)
 
-    # 3) dynamically shrink BOTH fonts until the block fits inside the zone
+    JA_RO_GAP = 14
+
+    # 3) dynamically shrink BOTH fonts until everything fits between the
+    #    fixed top anchor (ZONE_TOP) and the center divider.
     ja_lh = int(ja_size * 1.4)
     ro_lh = 52
     while True:
-        block_h = n_ja * ja_lh + (30 if n_ro else 0) + n_ro * ro_lh
+        block_h = n_ja * ja_lh + (JA_RO_GAP if n_ro else 0) + n_ro * ro_lh
         if block_h <= ZONE_H or ja_size <= 20:
             break
         ja_size = max(20, ja_size - 2)
@@ -444,15 +481,18 @@ def create_frame(turn, output_path, frame_num=0):
         ja_lh = int(ja_size * 1.4)
         ro_lh = int(ro_size * 1.3)
 
-    # 4) center the whole block vertically inside the zone
-    block_h = n_ja * ja_lh + (30 if n_ro else 0) + n_ro * ro_lh
-    block_top = ZONE_TOP + (ZONE_H - block_h) // 2
-    ja_center = block_top + n_ja * ja_lh // 2
-    draw_rich_text_centered(draw, " ".join(final_lines), center_y=ja_center,
-                            font=ja_font, max_w=1550, line_height=ja_lh)
-    if n_ro:
-        ro_center = block_top + n_ja * ja_lh + 30 + n_ro * ro_lh // 2
-        ro_font = load_font(ro_size, bold=False, italic=True)
+    # measured: mm-anchor centers on ascender box, so subtract the fixed
+    # ascender offset to hit a true ~40px ink gap
+    JA_RO_GAP = 14
+    ja_ink_top, ja_ink_bottom = draw_rich_text_centered(
+        draw, " ".join(final_lines), center_y=ZONE_TOP + n_ja * ja_lh // 2,
+        font=ja_font, max_w=1550, line_height=ja_lh)
+
+    if n_ro and ro_font is not None:
+        target_top = ja_ink_bottom + JA_RO_GAP
+        ih = _ro_ink_height(ro_font, ro_lines)
+        ly0 = target_top + ih / 2
+        ro_center = ly0 - ro_lh // 2 + (n_ro * ro_lh) // 2
         draw_english_translation(draw, " ".join(ro_lines), center_y=ro_center,
                                  font=ro_font, max_w=1350, line_height=ro_lh)
 
