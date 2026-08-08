@@ -122,6 +122,23 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+
+def _purify_japanese(text):
+    """Remove stray Latin/English letters that leaked into the Japanese field.
+    Keeps hiragana/katakana/kanji, Japanese punctuation, digits and the
+    **bold** markers used for target-word highlighting. Converts any leftover
+    Latin run (but not '**') into nothing so the Japanese line stays clean."""
+    if not text:
+        return text
+    text = clean_text(text)
+    text = text.replace('**', '\u0001')  # protect highlight markers
+    text = re.sub(r'[A-Za-z\u00c0-\u024f]+', '', text)
+    text = text.replace('\u0001', '**')
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        return ""
+    return text
+
 def sanitize_latin(text):
     """Convert leaked non-Latin characters to font-safe Latin equivalents so
     romaji/English never show tofu glyphs. Handles macrons, full-width forms
@@ -462,14 +479,35 @@ def create_frame(turn, output_path, frame_num=0):
     n_ro = len(ro_lines)
 
     JA_RO_GAP = 14
+    SAFE_BOTTOM = ZONE_BOTTOM - 6
 
-    # 3) dynamically shrink BOTH fonts until everything fits between the
-    #    fixed top anchor (ZONE_TOP) and the center divider.
+    def _measure_block():
+        """Render ja+ro to a temp canvas and return (ja_center, ro_center, ink_bottom).
+        Mirrors the real draw path so measured ink is exactly what appears."""
+        tmp = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), DARK_BG)
+        td = ImageDraw.Draw(tmp)
+        ja_lh_ = int(ja_size * 1.4)
+        ja_center = ZONE_TOP + len(final_lines) * ja_lh_ // 2
+        _, ja_ib = draw_rich_text_centered(td, " ".join(final_lines),
+                                           center_y=ja_center, font=ja_font,
+                                           max_w=1550, line_height=ja_lh_)
+        if not n_ro:
+            return ja_center, None, ja_ib
+        ih = _ro_ink_height(ro_font, ro_lines)
+        target_top = ja_ib + JA_RO_GAP
+        ly0 = target_top + ih / 2
+        ro_center = ly0 - ro_lh // 2 + (n_ro * ro_lh) // 2
+        _, ro_ib = draw_english_translation(td, " ".join(ro_lines), center_y=ro_center,
+                                            font=ro_font, max_w=1350, line_height=ro_lh)
+        return ja_center, ro_center, ro_ib
+
+    # 3) dynamically shrink BOTH fonts until the MEASURED ink block stays
+    #    clear of the center divider (real ink, not just estimated line-h).
     ja_lh = int(ja_size * 1.4)
-    ro_lh = 52
+    ro_lh = int(ro_size * 1.3)
     while True:
-        block_h = n_ja * ja_lh + (JA_RO_GAP if n_ro else 0) + n_ro * ro_lh
-        if block_h <= ZONE_H or ja_size <= 20:
+        ja_center, ro_center, ink_bottom = _measure_block()
+        if ink_bottom <= SAFE_BOTTOM or ja_size <= 20:
             break
         ja_size = max(20, ja_size - 2)
         ro_size = max(18, ro_size - 1)
@@ -482,18 +520,10 @@ def create_frame(turn, output_path, frame_num=0):
         ja_lh = int(ja_size * 1.4)
         ro_lh = int(ro_size * 1.3)
 
-    # measured: mm-anchor centers on ascender box, so subtract the fixed
-    # ascender offset to hit a true ~40px ink gap
-    JA_RO_GAP = 14
-    ja_ink_top, ja_ink_bottom = draw_rich_text_centered(
-        draw, " ".join(final_lines), center_y=ZONE_TOP + n_ja * ja_lh // 2,
-        font=ja_font, max_w=1550, line_height=ja_lh)
-
-    if n_ro and ro_font is not None:
-        target_top = ja_ink_bottom + JA_RO_GAP
-        ih = _ro_ink_height(ro_font, ro_lines)
-        ly0 = target_top + ih / 2
-        ro_center = ly0 - ro_lh // 2 + (n_ro * ro_lh) // 2
+    ja_center, ro_center, _ = _measure_block()
+    draw_rich_text_centered(draw, " ".join(final_lines), center_y=ja_center,
+                            font=ja_font, max_w=1550, line_height=ja_lh)
+    if n_ro and ro_center is not None:
         draw_english_translation(draw, " ".join(ro_lines), center_y=ro_center,
                                  font=ro_font, max_w=1350, line_height=ro_lh)
 
@@ -543,6 +573,7 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural Japanese. Include romaji (English transliteration) for every Japanese line. NO filler sounds.
+IMPORTANT: The "japanese" field MUST be written 100% in Japanese characters (hiragana, katakana, kanji) - NEVER use Latin/English letters in the japanese field. Loanwords like "coffee" or "train" must be written in katakana (e.g. コーヒー, でんしゃ). English only appears in the "english" field.
 IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "\u79c1\u305f\u3061\u306f**\u672a\u6765**\u3092\u898b\u307e\u3059\u3002"
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "japanese" (Japanese text), "romaji" (English transliteration of the Japanese), and "english" (English translation):
@@ -554,7 +585,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": AI_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds."},
+                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). Never write English or romaji letters in the japanese field - loanwords go in katakana (コーヒー, すまーとふぉん). English belongs only in the english field."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.9
@@ -604,7 +635,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "
                     continue
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
-                    "japanese": clean_text(es),
+                    "japanese": _purify_japanese(es),
                     "romaji": clean_text(romaji) if romaji else "",
                     "english": clean_text(en) if en else "Translation unavailable"
                 })
