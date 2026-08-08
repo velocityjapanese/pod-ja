@@ -457,7 +457,8 @@ def create_frame(turn, output_path, frame_num=0):
 
     # 2) wrap romaji at the starting italic size
     ro_size = 40
-    ro_lines = _wrap(romaji_text, f_english, 1350) if romaji_text else []
+    ro_font = load_font(ro_size, bold=False, italic=True)
+    ro_lines = _wrap(romaji_text, ro_font, 1350) if romaji_text else []
     n_ro = len(ro_lines)
 
     JA_RO_GAP = 14
