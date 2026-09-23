@@ -11,6 +11,12 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 load_dotenv()
 
+try:
+    import pykakasi
+    _kakasi_inst = pykakasi.kakasi()
+except Exception:
+    _kakasi_inst = None
+
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL") or "openai"
 
@@ -138,6 +144,37 @@ def _purify_japanese(text):
     if not text:
         return ""
     return text
+
+def to_accurate_romaji(japanese):
+    """Accurate Japanese -> Hepburn Romaji converter.
+    Uses pykakasi for full Kanji+Kana morphological transliteration with natural spacing.
+    Falls back to kana mapping if pykakasi is unavailable."""
+    if not japanese:
+        return ""
+    clean_ja = re.sub(r'\*\*(.*?)\*\*', r'\1', japanese)
+    if _kakasi_inst is not None:
+        try:
+            res = _kakasi_inst.convert(clean_ja)
+            words = [item['hepburn'] for item in res if item.get('hepburn')]
+            romaji = ' '.join(words)
+            romaji = re.sub(r'\s+([,!?.\u3001\u3002])', r'\1', romaji)
+            romaji = romaji.replace('、', ', ').replace('。', '. ').replace('！', '! ').replace('？', '? ')
+            romaji = re.sub(r'\s+', ' ', romaji).strip()
+            sentences = re.split(r'([.!?]\s*)', romaji)
+            cap_s = ''
+            for s in sentences:
+                if s and not s.isspace():
+                    if not cap_s or cap_s.endswith('. ') or cap_s.endswith('! ') or cap_s.endswith('? '):
+                        cap_s += s[0].upper() + s[1:] if len(s) > 1 else s.upper()
+                    else:
+                        cap_s += s
+                else:
+                    cap_s += s
+            if re.search(r'[a-zA-Z]{2,}', cap_s):
+                return cap_s.strip()
+        except Exception as e:
+            print(f"  pykakasi error: {e}")
+    return _romanize_fallback(clean_ja)
 
 def _romanize_fallback(japanese):
     """Lightweight kana->romaji converter used only when the AI omitted romaji.
@@ -527,11 +564,10 @@ def create_frame(turn, output_path, frame_num=0):
     ZONE_H = ZONE_BOTTOM - ZONE_TOP
     japanese_text = turn.get("japanese", turn.get("spanish", ""))
     romaji_text = sanitize_latin(turn.get("romaji", ""))
-    if not romaji_text:
-        fallback = _romanize_fallback(japanese_text)
-        if any(ord(c) > 0x2e7f for c in fallback):
-            fallback = ""
-        romaji_text = fallback or sanitize_latin(turn.get("english", ""))
+    if not re.search(r'[a-zA-Z]{2,}', romaji_text):
+        romaji_text = to_accurate_romaji(japanese_text)
+    if not re.search(r'[a-zA-Z]{2,}', romaji_text):
+        romaji_text = sanitize_latin(turn.get("english", ""))
 
     def _wrap(text, font, max_w):
         tokens = _cjk_tokens(text, font, draw)
@@ -658,9 +694,10 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural Japanese. Include romaji (English transliteration) for every Japanese line. NO filler sounds.
 IMPORTANT: The "japanese" field MUST be written 100% in Japanese characters (hiragana, katakana, kanji) - NEVER use Latin/English letters in the japanese field. Loanwords like "coffee" or "train" must be written in katakana (e.g. コーヒー, でんしゃ). English only appears in the "english" field.
+IMPORTANT: The "romaji" field MUST be written 100% in Latin letters (Hepburn romanization, e.g. "Watashitachi wa mirai o mimasu."). NEVER put Japanese characters in the romaji field.
 IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "\u79c1\u305f\u3061\u306f**\u672a\u6765**\u3092\u898b\u307e\u3059\u3002"
 
-Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "japanese" (Japanese text), "romaji" (English transliteration of the Japanese), and "english" (English translation):
+Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "japanese" (Japanese text), "romaji" (English transliteration in Latin letters), and "english" (English translation):
 [{{"speaker": "{current_host}", "japanese": "...", "romaji": "...", "english": "..."}},
  {{"speaker": "{next_host}", "japanese": "...", "romaji": "...", "english": "..."}}]"""
 
@@ -669,7 +706,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": AI_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). Never write English or romaji letters in the japanese field - loanwords go in katakana (コーヒー, すまーとふぉん). English belongs only in the english field."},
+                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). The romaji field must contain ONLY Latin letters Hepburn transliteration. English belongs only in the english field."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.9
@@ -717,10 +754,14 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "
                 romaji = turn.get("romaji") or turn.get("romanji") or turn.get("transliteration") or ""
                 if not es:
                     continue
+                ja_clean = _purify_japanese(es)
+                ro_clean = sanitize_latin(clean_text(romaji)) if romaji else ""
+                if not re.search(r'[a-zA-Z]{2,}', ro_clean):
+                    ro_clean = to_accurate_romaji(ja_clean)
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
-                    "japanese": _purify_japanese(es),
-                    "romaji": clean_text(romaji) if romaji else "",
+                    "japanese": ja_clean,
+                    "romaji": ro_clean,
                     "english": clean_text(en) if en else "Translation unavailable"
                 })
             if valid:
@@ -783,9 +824,10 @@ def generate_script():
         return _fallback_script(topic_es, topic_en), topic_es, topic_en
 
     # Short 2-line intro: Kenji (Host2) first, then Hana (Host1), then topic
+    topic_romaji = to_accurate_romaji(topic_es)
     all_turns[0]["speaker"] = "Host2"
     all_turns[0]["japanese"] = f"こんにちは、健二です。Velocity Japanese へようこそ。今日は{topic_es}について話します。"
-    all_turns[0]["romaji"] = f"Konnichiwa, Kenji desu. Velocity Japanese e yōkoso. Kyō wa {topic_es} ni tsuite hanashimasu."
+    all_turns[0]["romaji"] = f"Konnichiwa, Kenji desu. Velocity Japanese e yōkoso. Kyō wa {topic_romaji} ni tsuite hanashimasu."
     all_turns[0]["english"] = f"Hi, I'm Kenji. Welcome to Velocity Japanese Podcast. Today we talk about {topic_en}."
     if len(all_turns) > 1:
         all_turns[1]["speaker"] = "Host1"
@@ -793,18 +835,28 @@ def generate_script():
         all_turns[1]["romaji"] = f"Arigatō, Kenji-san. Kyō no tēma wa totemo **omoshiroi** desu. Hajimemashō."
         all_turns[1]["english"] = f"Thanks, Kenji. Today's topic is very interesting. Let's start."
 
+    # Final guarantee across ALL turns: ensure valid Latin romaji exists for every single turn
+    for turn in all_turns:
+        ja = turn.get("japanese", "")
+        ro = sanitize_latin(turn.get("romaji", ""))
+        if not re.search(r'[a-zA-Z]{2,}', ro):
+            turn["romaji"] = to_accurate_romaji(ja)
+        else:
+            turn["romaji"] = ro
+
     print(f"  Script: {len(all_turns)} turns, topic: {topic_es}")
     return all_turns, topic_es, topic_en
 
 
 def _fallback_script(topic_es, topic_en):
     turns = []
+    topic_ro = to_accurate_romaji(topic_es)
     for i in range(150):
         s = "Host2" if i % 2 == 0 else "Host1"
         if s == "Host2":
-            turns.append({"speaker": s, "japanese": f"こんにちは、健二です。今日は{topic_es}について話します。", "romaji": f"Konnichiwa, Kenji desu. Kyou wa {topic_es} ni tsuite hanashimasu.", "english": f"Hi, I'm Kenji. Today we talk about {topic_en}."})
+            turns.append({"speaker": s, "japanese": f"こんにちは、健二です。今日は{topic_es}について話します。", "romaji": f"Konnichiwa, Kenji desu. Kyou wa {topic_ro} ni tsuite hanashimasu.", "english": f"Hi, I'm Kenji. Today we talk about {topic_en}."})
         else:
-            turns.append({"speaker": s, "japanese": f"いいですね、健二さん。{topic_es}はとても**面白い**です。", "romaji": f"Ii desu ne, Kenji-san. {topic_es} wa totemo **omoshiroi** desu.", "english": f"Good idea, Kenji. {topic_en} is very interesting."})
+            turns.append({"speaker": s, "japanese": f"いいですね、健二さん。{topic_es}はとても**面白い**です。", "romaji": f"Ii desu ne, Kenji-san. {topic_ro} wa totemo **omoshiroi** desu.", "english": f"Good idea, Kenji. {topic_en} is very interesting."})
     return turns
 
 
