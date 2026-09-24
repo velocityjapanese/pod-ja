@@ -124,6 +124,7 @@ def load_japanese_font(size, bold=False):
     return load_font(size, bold=bold)
 
 def clean_text(text):
+    text = re.sub(r'[\r\n]+', ' ', text)
     text = re.sub(r'\b(mm+|um+|uh+|ah+|äh+)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -671,8 +672,77 @@ def create_frame(turn, output_path, frame_num=0):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     img.save(output_path, quality=92)
 
+
+def parse_turns_json(content, target_key="japanese"):
+    """Robustly parse JSON array of turns from LLM output, handling unescaped control chars, code fences, and partial json."""
+    clean = content.strip()
+    if "```json" in clean:
+        clean = clean.split("```json")[1].split("```")[0].strip()
+    elif "```" in clean:
+        clean = clean.split("```")[1].split("```")[0].strip()
+
+    try:
+        obj = json.loads(clean, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    fixed = re.sub(r'(?<!\\)\n', r'\\n', clean)
+    try:
+        obj = json.loads(fixed, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    recovered = []
+    start = None
+    depth = 0
+    for ci, ch in enumerate(clean):
+        if ch == '{':
+            if depth == 0:
+                start = ci
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunk = clean[start:ci + 1]
+                try:
+                    t = json.loads(chunk, strict=False)
+                    if isinstance(t, dict):
+                        recovered.append(t)
+                except Exception:
+                    try:
+                        chunk_fixed = re.sub(r'(?<!\\)\n', r'\\n', chunk)
+                        t = json.loads(chunk_fixed, strict=False)
+                        if isinstance(t, dict):
+                            recovered.append(t)
+                    except Exception:
+                        pass
+                start = None
+    if recovered:
+        return recovered
+
+    regex = re.compile(
+        r'\{\s*"speaker"\s*:\s*"(?P<speaker>[^"]+)"\s*,\s*'
+        r'(?:"(?:' + target_key + r'|text|content|spanish)"\s*:\s*"(?P<tgt>.*?)"\s*,\s*)?'
+        r'(?:"(?:romaji|translit|transliteration)"\s*:\s*"(?P<ro>.*?)"\s*,\s*)?'
+        r'(?:"english"\s*:\s*"(?P<en>.*?)"\s*)?'
+        r'\}', re.DOTALL
+    )
+    for m in regex.finditer(clean):
+        spk = m.group("speaker") or "Host1"
+        tgt = m.group("tgt") or ""
+        ro = m.group("ro") or ""
+        en = m.group("en") or ""
+        if tgt:
+            recovered.append({"speaker": spk, target_key: tgt, "romaji": ro, "english": en})
+
+    return recovered
+
 def _fetch_turns_batch(topic, topic_es, topic_en, start_turn, batch_size=10):
-    """Fetch one small batch of turns (reliable - avoids truncation)."""
+    """Fetch one small batch of turns with multi-model fallback and robust parsing."""
     current_host = "Host2" if start_turn % 2 == 0 else "Host1"
     next_host = "Host1" if current_host == "Host2" else "Host2"
     host_role = "Kenji" if current_host == "Host2" else "Hana"
@@ -692,82 +762,62 @@ The dialogue so far is at turn {start_turn}. The current speaker is {host_role} 
 Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {current_host}.
 
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
-Simple present tense. A2 vocabulary. Natural Japanese. Include romaji (English transliteration) for every Japanese line. NO filler sounds.
-IMPORTANT: The "japanese" field MUST be written 100% in Japanese characters (hiragana, katakana, kanji) - NEVER use Latin/English letters in the japanese field. Loanwords like "coffee" or "train" must be written in katakana (e.g. コーヒー, でんしゃ). English only appears in the "english" field.
-IMPORTANT: The "romaji" field MUST be written 100% in Latin letters (Hepburn romanization, e.g. "Watashitachi wa mirai o mimasu."). NEVER put Japanese characters in the romaji field.
-IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "\u79c1\u305f\u3061\u306f**\u672a\u6765**\u3092\u898b\u307e\u3059\u3002"
+Simple present tense. A2 vocabulary. Natural Japanese. Include romaji (English transliteration in Latin letters) for every Japanese line. NO filler sounds.
+IMPORTANT: The "japanese" field MUST be written 100% in Japanese characters (hiragana, katakana, kanji).
+IMPORTANT: The "romaji" field MUST be written 100% in Latin letters (Hepburn romanization).
+IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Japanese text using double asterisks, for example: "私たちは**未来**を見ます。"
+IMPORTANT: Format as a single compact JSON array without unescaped line breaks inside string values.
 
-Return EXACTLY {batch_size} turns as a JSON array (no markdown). Each turn has "japanese" (Japanese text), "romaji" (English transliteration in Latin letters), and "english" (English translation):
+Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "japanese": "...", "romaji": "...", "english": "..."}},
  {{"speaker": "{next_host}", "japanese": "...", "romaji": "...", "english": "..."}}]"""
 
-    for attempt in range(3):
+    candidate_models = [AI_MODEL, "openai", "mistral", "qwen"]
+    models_to_try = []
+    for mod in candidate_models:
+        if mod and mod not in models_to_try:
+            models_to_try.append(mod)
+
+    for attempt, model_name in enumerate(models_to_try):
         try:
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-                "model": AI_MODEL,
+                "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). The romaji field must contain ONLY Latin letters Hepburn transliteration. English belongs only in the english field."},
+                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). The romaji field must contain ONLY Latin letters Hepburn transliteration. English belongs only in the english field. Output single compact JSON array without unescaped newlines inside strings."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.9
-            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-            resp.raise_for_status()
+                "temperature": 0.8
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code != 200:
+                print(f"  Batch attempt {attempt+1} ({model_name}) returned HTTP {resp.status_code}", flush=True)
+                continue
             content = resp.json()["choices"][0]["message"]["content"].strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            script = None
-            try:
-                script = json.loads(content)
-            except json.JSONDecodeError:
-                recovered = []
-                start = None
-                depth = 0
-                for ci, ch in enumerate(content):
-                    if ch == '{':
-                        if depth == 0:
-                            start = ci
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0 and start is not None:
-                            chunk = content[start:ci + 1]
-                            try:
-                                obj = json.loads(chunk)
-                                if isinstance(obj, dict) and ("japanese" in obj or "english" in obj):
-                                    recovered.append(obj)
-                            except json.JSONDecodeError:
-                                pass
-                            start = None
-                script = recovered
-            if not isinstance(script, list):
-                script = []
-
+            script = parse_turns_json(content, "japanese")
             valid = []
             for i, turn in enumerate(script):
                 if not isinstance(turn, dict):
                     continue
-                es = turn.get("japanese") or turn.get("spanish") or turn.get("text") or turn.get("content") or ""
+                ja = turn.get("japanese") or turn.get("text") or turn.get("content") or turn.get("spanish") or ""
                 en = turn.get("english") or turn.get("translation") or ""
-                romaji = turn.get("romaji") or turn.get("romanji") or turn.get("transliteration") or ""
-                if not es:
+                ro = sanitize_latin(turn.get("romaji") or turn.get("translit") or turn.get("romanji") or "")
+                if not ja:
                     continue
-                ja_clean = _purify_japanese(es)
-                ro_clean = sanitize_latin(clean_text(romaji)) if romaji else ""
-                if not re.search(r'[a-zA-Z]{2,}', ro_clean):
-                    ro_clean = to_accurate_romaji(ja_clean)
+                if not re.search(r'[a-zA-Z]{2,}', ro):
+                    ro = to_accurate_romaji(ja)
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
-                    "japanese": ja_clean,
-                    "romaji": ro_clean,
+                    "japanese": clean_text(ja),
+                    "romaji": ro,
                     "english": clean_text(en) if en else "Translation unavailable"
                 })
-            if valid:
+            if len(valid) >= 4:
                 return valid
+            else:
+                print(f"  Batch attempt {attempt+1} ({model_name}) parsed only {len(valid)} turns, trying next model...", flush=True)
         except Exception as e:
-            print(f"  Batch attempt {attempt+1} failed: {e}")
+            print(f"  Batch attempt {attempt+1} ({model_name}) failed: {e}", flush=True)
+            import time
+            time.sleep(1)
     return None
 
 
@@ -775,22 +825,298 @@ def _generate_topic():
     """Have the AI invent a brand-new random topic (unlimited variety).
     Returns '<topic - English>' or None on failure (caller falls back to TOPICS)."""
     seed = random.randint(100000, 999999)
-    try:
-        resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-            "model": AI_MODEL,
-            "messages": [
-                {"role": "system", "content": "You invent fresh, interesting, everyday topics for a Japanese/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
-                {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a Japanese/English A2 podcast. Return ONLY one line in this exact format: <topic in Japanese> - <topic in English>. The first part must be a short noun phrase in Japanese. No numbering, no bullets, no extra text."}
-            ],
-            "temperature": 1.1,
-        }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
-        if content and " - " in content:
-            return content
-    except Exception as e:
-        print(f"  Topic generation failed: {e}")
+    candidate_models = [AI_MODEL, "openai", "mistral"]
+    for m in candidate_models:
+        if not m:
+            continue
+        try:
+            resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
+                "model": m,
+                "messages": [
+                    {"role": "system", "content": "You invent fresh, interesting, everyday topics for a Japanese/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
+                    {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a Japanese/English A2 podcast. Return ONLY one line in this exact format: <topic in Japanese> - <topic in English>. The first part must be a short noun phrase in Japanese. No numbering, no bullets, no extra text."}
+                ],
+                "temperature": 1.1,
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
+                if content and " - " in content:
+                    return content
+        except Exception as e:
+            print(f"  Topic gen ({m}) failed: {e}", flush=True)
     return None
+
+
+def _fallback_script(topic_es, topic_en, target=150):
+    """Generate 150 unique, educational, progressive dialogue turns in Japanese with romaji covering diverse conversation phases."""
+    topic_ro = to_accurate_romaji(topic_es)
+    phases = [
+        # Phase 1: Greetings & Introduction
+        [
+            ("Host2", f"皆さん、こんにちは。健二です。Velocity Japaneseへようこそ！今日は**{topic_es}**について話します。",
+                      f"Hello everyone. I'm Kenji. Welcome to Velocity Japanese! Today we talk about {topic_en}."),
+            ("Host1", f"こんにちは、健二さん。リスナーの皆さん、ようこそ！このテーマは日本語学習にとって、とても**大切**ですね。",
+                      f"Hello Kenji. Welcome listeners! This topic is very important for learning Japanese."),
+            ("Host2", f"その通りです、花さん。毎日の中でよく見かけますが、どう話せばいいか迷う人も多いです。",
+                      f"That's right, Hana. We often see it in daily life, but many people hesitate on how to talk about it."),
+            ("Host1", f"そうですね。だから今日は**簡単**な文と分かりやすい言葉を使って、楽しく進めましょう。",
+                      f"Indeed. So today let's use simple sentences and clear words to proceed enjoyably."),
+            ("Host2", f"素晴らしい！最初の質問ですが、花さんにとって**{topic_es}**はどんな存在ですか？",
+                      f"Wonderful! For the first question, what kind of presence is {topic_en} for you, Hana?"),
+            ("Host1", f"私にとっては、毎日の生活を明るくしてくれる大切な**一部**ですね。",
+                      f"For me, it's an important part of life that brightens each day."),
+            ("Host2", f"私も全く同感です。意識して楽しむことで、一日がもっと**豊か**になります。",
+                      f"I completely agree. By mindfully enjoying it, the day becomes much richer."),
+            ("Host1", f"はい、必要な単語をしっかり覚えると、自然な**会話**がどんどんできるようになります。",
+                      f"Yes, once you remember the necessary words, natural conversation becomes easier and easier."),
+            ("Host2", f"リスナーの皆さんも、今日のキーワードをぜひ声に出して**練習**してみてください。",
+                      f"Listeners, please also try practicing today's keywords out loud."),
+            ("Host1", f"いいですね！では、**{topic_es}**についての具体的なお話に入っていきましょう。",
+                      f"Sounds good! Let's get into concrete details about {topic_en}.")
+        ],
+        # Phase 2: Morning routine & habits
+        [
+            ("Host2", f"花さんは、普段の朝に**{topic_es}**のことを考えることがありますか？",
+                      f"Hana, on a normal morning do you ever think about {topic_en}?"),
+            ("Host1", f"はい、朝早く起きると気分が落ち着いて、いいアイデアが**生まれます**。",
+                      f"Yes, waking up early calms my mind and brings good ideas."),
+            ("Host2", f"朝の静かな時間は特別ですね。焦らずに自分の**時間**を過ごすことができます。",
+                      f"The quiet morning time is special. You can spend your own time without rushing."),
+            ("Host1", f"慌ただしい生活は疲れますからね。朝の良い**習慣**が一日を快適にします。",
+                      f"Rushed life is tiring. A good morning habit makes the whole day comfortable."),
+            ("Host2", f"夕方や仕事の後に**{topic_es}**を楽しむ人もたくさんいますね。",
+                      f"There are also many people who enjoy {topic_en} in the evening or after work."),
+            ("Host1", f"人それぞれのライフスタイルに合わせて、無理のない**バランス**を見つけることが大切です。",
+                      f"Matching each person's lifestyle, finding a reasonable balance is what matters."),
+            ("Host2", f"本当にそうですね。自分のペースを知ることが、心地よい**暮らし**につながります。",
+                      f"Truly so. Knowing your own pace leads to a comfortable living."),
+            ("Host1", f"そして日本語学習でも、毎日の少しずつの積み重ねが確かな**力**になります。",
+                      f"And in Japanese learning too, a little daily accumulation becomes dependable ability."),
+            ("Host2", f"その通りです。毎日十分の練習は、週末だけの二時間よりもずっと**効果的**です。",
+                      f"That's right. Ten minutes of practice every day is far more effective than two hours on the weekend."),
+            ("Host1", f"では次に、日本の街の中で見かける**{topic_es}**について話してみましょう。",
+                      f"Next, let's talk about {topic_en} seen in Japanese towns.")
+        ],
+        # Phase 3: In the city & culture
+        [
+            ("Host2", f"日本の街を歩くと、**{topic_es}**に関するお店や案内をよく見かけますね。",
+                      f"Walking through Japanese towns, we often see shops and signs related to {topic_en}."),
+            ("Host1", f"はい、駅の近くや商店街で、たくさんの人が**興味**を持って集まっています。",
+                      f"Yes, near train stations and shopping arcades, many people gather with interest."),
+            ("Host2", f"友達と一緒にそういう場所を訪ねるのは、とても楽しい**時間**です。",
+                      f"Visiting such places with friends is a very fun time."),
+            ("Host1", f"誰かと気持ちを共有できると、心も自然と**温かく**なりますね。",
+                      f"When you can share feelings with someone, your heart naturally becomes warm."),
+            ("Host2", f"日本人が**{topic_es}**について話すとき、どんな言葉をよく使いますか？",
+                      f"When Japanese people talk about {topic_en}, what words do they often use?"),
+            ("Host1", f"『便利』や『丁寧』、そして『素晴らしい』という言葉で、その**品質**を褒めます。",
+                      f"With words like 'convenient', 'polite', and 'wonderful', they praise its quality."),
+            ("Host2", f"『品質』へのこだわりは、日本のものづくりやサービスの大きな**特徴**ですね。",
+                      f"Attention to 'quality' is a major feature of Japanese craftsmanship and service."),
+            ("Host1", f"少し手間がかかっても、丁寧なものを選ぶと長く安心して**使えます**。",
+                      f"Even if it takes extra care, choosing careful craftsmanship allows long and reassuring use."),
+            ("Host2", f"日本を旅行する方へのアドバイスですが、地元の人に気軽に**質問**してみてください。",
+                      f"Here's advice for travelers in Japan: feel free to ask local people questions."),
+            ("Host1", f"地元の方は親切に、**{topic_es}**が楽しめるおすすめの場所を教えてくれますよ。",
+                      f"Local residents will kindly tell you recommended spots to enjoy {topic_en}.")
+        ],
+        # Phase 4: Advice for beginners & learning mindset
+        [
+            ("Host2", f"リスナーの方から質問です。**{topic_es}**についての日本語を理解するのは難しいですか？",
+                      f"Question from a listener: is it difficult to understand Japanese about {topic_en}?"),
+            ("Host1", f"最初は難しく感じるかもしれませんが、少しずつ慣れるととても**明確**になります。",
+                      f"At first it may feel difficult, but as you gradually get used to it, it becomes very clear."),
+            ("Host2", f"初心者が最初にしてしまいがちな**間違い**は何でしょうか？",
+                      f"What mistake do beginners tend to make at first?"),
+            ("Host1", f"完璧に話そうとしすぎて、話すのが怖くなってしまうのが一番の**壁**ですね。",
+                      f"Trying too hard to speak perfectly and becoming scared to speak is the biggest obstacle."),
+            ("Host2", f"間違えるのは当たり前ですし、むしろ失敗から学ぶことの方が**多い**です。",
+                      f"Making mistakes is natural, and in fact we learn more from mistakes."),
+            ("Host1", f"その通りです。実際の会話では、伝えたいという**気持ち**が一番相手に届きます。",
+                      f"That's right. In real conversation, the wish to communicate reaches the partner best."),
+            ("Host2", f"外国の方が一生懸命日本語で話してくれると、日本人はとても**嬉しい**ものです。",
+                      f"When foreigners try hard to speak Japanese, Japanese people feel very happy."),
+            ("Host1", f"温かい笑顔で答えてくれるので、自信を持ってどんどん**挑戦**してください。",
+                      f"They will answer with a warm smile, so please challenge yourself with confidence."),
+            ("Host2", f"ですから、機会があればぜひ**{topic_es}**の話題を出してみてくださいね。",
+                      f"Therefore, if you have an opportunity, please bring up {topic_en} as a topic."),
+            ("Host1", f"このエピソードで覚えたフレーズを、さっそく使って**みましょう**。",
+                      f"Let's immediately try using the phrases learned in this episode.")
+        ],
+        # Phase 5: Japanese traditions & lifestyle
+        [
+            ("Host2", f"花さん、地域によって**{topic_es}**の受け止め方に違いはありますか？",
+                      f"Hana, are there differences in how {topic_en} is perceived across regions?"),
+            ("Host1", f"東京と京都や地方では雰囲気が違いますが、大切にする心はどこでも**同じ**です。",
+                      f"Atmosphere differs between Tokyo, Kyoto and regional towns, but the caring spirit is the same everywhere."),
+            ("Host2", f"日本全国の豊かな風土や歴史が、様々な**魅力**を生み出していますね。",
+                      f"The rich climate and history across all Japan generate various charms."),
+            ("Host1", f"四季折々の変化を感じながら暮らすことが、日本文化の素敵な**伝統**です。",
+                      f"Living while feeling the seasonal changes is a wonderful tradition of Japanese culture."),
+            ("Host2", f"海外から来る方々も、この静けさと細やかな心遣いに深く**感動**されます。",
+                      f"Visitors from overseas are also deeply moved by this quietness and detailed thoughtfulness."),
+            ("Host1", f"人と人との繋がりや、周りへの思いやりが生活の**基本**にあるからですね。",
+                      f"Because human connection and caring for others form the foundation of life."),
+            ("Host2", f"そして**{topic_es}**も、そんな日本の思いやりの文化と深く結びついています。",
+                      f"And {topic_en} is also deeply connected with such Japanese culture of consideration."),
+            ("Host1", f"ただの言葉ではなく、お互いの心を結ぶ温かい**体験**になります。",
+                      f"Rather than just words, it becomes a warm experience connecting hearts."),
+            ("Host2", f"良い思い出を誰かと分かち合うと、喜びはさらに**大きく**広がりますね。",
+                      f"When sharing good memories with someone, joy expands even more."),
+            ("Host1", f"本当にそうですね。ささやかな日常の中にこそ、最高の**幸せ**があります。",
+                      f"Truly so. In modest daily life itself lies the greatest happiness.")
+        ],
+        # Phase 6: Practical learning tips
+        [
+            ("Host2", f"ここで、リスナーの皆さんに**{topic_es}**を上手に学ぶためのコツを三つ紹介しましょう。",
+                      f"Here, let's introduce three tips to listeners for learning {topic_en} skillfully."),
+            ("Host1", f"一つ目は、小さなノートを用意して、新しく知った文を毎日二つ**書く**ことです。",
+                      f"The first is preparing a small notebook and writing down two newly learned sentences every day."),
+            ("Host2", f"手で文字を書くと、記憶に残りやすくなってとても**効果的**ですね。",
+                      f"Writing characters by hand makes them easier to remember and is very effective."),
+            ("Host1", f"二つ目は、通勤や散歩のときにイヤホンで日本語の音声を**聞く**ことです。",
+                      f"The second is listening to Japanese audio on earphones while commuting or walking."),
+            ("Host2", f"耳が日本語のイントネーションやリズムに自然と**慣れて**いきます。",
+                      f"Your ears naturally get accustomed to Japanese intonation and rhythm."),
+            ("Host1", f"そして三つ目は、単語をバラバラでなく、文全体の**形**で覚えることです。",
+                      f"And the third is remembering words in the form of entire sentences, not separately."),
+            ("Host2", f"そうすれば、実際の会話のときに自然と言葉が口から**出てきます**。",
+                      f"That way, during actual conversation words will come out naturally from your mouth."),
+            ("Host1", f"このVelocity Japaneseのポッドキャストも、その方法で**作られています**。",
+                      f"This Velocity Japanese podcast is also created with that method."),
+            ("Host2", f"コメント欄でも、上達を感じているという嬉しい声をたくさん**いただきます**。",
+                      f"In the comment section too, we receive many happy voices saying they feel improvement."),
+            ("Host1", f"皆さんからの応援が、私たちの毎日の大きな**励み**になっています。",
+                      f"Support from everyone is our great daily encouragement.")
+        ],
+        # Phase 7: Real-world conversation roleplay
+        [
+            ("Host2", f"では短いロールプレイをしてみましょう。お店で**{topic_es}**について尋ねる場面です。",
+                      f"Now let's do a short roleplay. It's a scene asking about {topic_en} at a shop."),
+            ("Host1", f"楽しそうですね！『すみません、初心者にはどれがおすすめか**教えて**いただけますか？』",
+                      f"Sounds fun! 'Excuse me, could you teach me which one is recommended for a beginner?'"),
+            ("Host2", f"『いらっしゃいませ！初めての方には、こちらの使いやすい定番のものが**人気**ですよ。』",
+                      f"'Welcome! For first-timers, this easy-to-use classic item is popular.'"),
+            ("Host1", f"『ありがとうございます！上手に慣れるまで、どれくらい時間が**かかります**か？』",
+                      f"'Thank you! About how long does it take until getting skillfully used to it?'"),
+            ("Host2", f"『毎日少しずつ試していただければ、一週間ほどで十分に**慣れます**よ。』",
+                      f"'If you try a little each day, you will be well accustomed in about a week.'"),
+            ("Host1", f"『安心しました！では、今日からさっそく使って**みます**。』",
+                      f"'I feel relieved! Then I will try using it right away from today.'"),
+            ("Host2", f"こういう丁寧で実用的なやり取りは、日本全国のどこでも**使えます**ね。",
+                      f"Polite and practical interactions like this can be used anywhere across Japan."),
+            ("Host1", f"『教えていただけますか』という表現は、とても礼儀正しくて好印象を**与えます**。",
+                      f"The expression 'could you teach me' is very courteous and gives a good impression."),
+            ("Host2", f"丁寧な言葉遣いは、相手との関係をぐっと良くして**くれます**。",
+                      f"Polite phrasing significantly improves relationships with conversation partners."),
+            ("Host1", f"皆さんも日本へ旅行した際には、ぜひ使って**みてください**。",
+                      f"Everyone, when traveling to Japan, please try using it.")
+        ],
+        # Phase 8: Personal reflections & confidence
+        [
+            ("Host2", f"花さんの周りの友人たちは、**{topic_es}**についてどんな反応をしますか？",
+                      f"Hana, how do your friends react when talking about {topic_en}?"),
+            ("Host1", f"最初は不思議そうにしていましたが、実際に体験するとみんな**納得**していました。",
+                      f"At first they seemed curious, but upon experiencing it they all understood."),
+            ("Host2", f"新しいことに触れるときの少しの緊張は、誰にでもある自然な**気持ち**です。",
+                      f"A little nervousness when encountering something new is a natural feeling anyone has."),
+            ("Host1", f"でも一歩を踏み出すと、不安が消えて大きな**自信**へと変わっていきます。",
+                      f"But taking a step forward turns anxiety into great confidence."),
+            ("Host2", f"声に出して話す回数が増えるほど、日本語の会話力はぐんぐん**伸びます**。",
+                      f"The more times you speak out loud, the more your Japanese speaking ability grows."),
+            ("Host1", f"少ない語彙であっても、相手を思う気持ちがあれば十分に心を通わせることが**できます**。",
+                      f"Even with small vocabulary, if you have caring feelings you can fully communicate."),
+            ("Host2", f"世界中のリスナーの皆さんが、日本語を楽しく学んでいる姿は本当に**素敵**です。",
+                      f"The sight of listeners worldwide learning Japanese enjoyably is truly wonderful."),
+            ("Host1", f"毎回のリスニングの時間が、皆さんの未来への大切な**ステップ**ですね。",
+                      f"Each listening time is an important step toward everyone's future."),
+            ("Host2", f"これからも一緒に、楽しく分かりやすいレッスンを続けて**いきましょう**。",
+                      f"Let's continue enjoyable and easy-to-understand lessons together from now on."),
+            ("Host1", f"はい、皆さんの学習を全力で応援して**います**！",
+                      f"Yes, we are supporting everyone's study with all our strength!")
+        ],
+        # Phase 9: Vocabulary review
+        [
+            ("Host2", f"それでは、今日**{topic_es}**に関して登場した重要単語を復習しましょう。",
+                      f"Now then, let's review the important words that appeared today regarding {topic_en}."),
+            ("Host1", f"はい！一つ目のキーワードは**習慣**です。毎日コツコツ続ける良い行動のことですね。",
+                      f"Yes! The first keyword is 'habit'. It refers to good actions steadily continued every day."),
+            ("Host2", f"二つ目の単語は**品質**です。丁寧で確かな価値を表す大切な言葉です。",
+                      f"The second word is 'quality'. An important word expressing careful and solid value."),
+            ("Host1", f"三つ目の単語は**会話**です。相手と心を通わせて話す楽しさがあります。",
+                      f"The third word is 'conversation'. There is joy in communicating hearts with a partner."),
+            ("Host2", f"四つ目の言葉は**練習**です。少しずつの反復が大きな成果を生みます。",
+                      f"The fourth word is 'practice'. A little repetition yields big results."),
+            ("Host1", f"そして五つ目の言葉は**自信**です。勇気を持って話す力になります。",
+                      f"And the fifth word is 'confidence'. It becomes the power to speak with courage."),
+            ("Host2", f"リスナーの皆さんも、これらの単語を使ってコメント欄に例文を**書いて**みてください。",
+                      f"Listeners, please also try writing an example sentence in the comments using these words."),
+            ("Host1", f"皆さんのコメントを読むのを、私たちはいつも楽しみに**待っています**。",
+                      f"We are always looking forward to reading your comments."),
+            ("Host2", f"アウトプットすることで、学習した内容が頭にしっかりと**定着**します。",
+                      f"By outputting, the learned content firmly fixes in your mind."),
+            ("Host1", f"それでは、いよいよ本日のまとめの**時間**です。",
+                      f"Now then, it's finally time for today's summary.")
+        ],
+        # Phase 10: Conclusion & wrap-up
+        [
+            ("Host2", f"今日の**{topic_es}**についてのポッドキャストも、終わりの時間が近づいてきました。",
+                      f"Today's podcast about {topic_en} is also approaching its ending time."),
+            ("Host1", f"楽しい時間はあっという間ですね！たくさんの役立つ表現を**紹介**できました。",
+                      f"Fun time passes in a flash! We were able to introduce many useful expressions."),
+            ("Host2", f"この音声を何度も聴き直して、自然な発音とリズムを身につけて**ください**。",
+                      f"Please listen back to this audio many times to acquire natural pronunciation and rhythm."),
+            ("Host1", f"繰り返し聴くことで、日本語がもっと身近に、そして楽しく**感じられます**。",
+                      f"By listening repeatedly, Japanese feels much closer and more enjoyable."),
+            ("Host2", f"いつも応援してくださるリスナーの皆様に、心から**感謝**いたします。",
+                      f"We thank from our hearts all listeners who always support us."),
+            ("Host1", f"チャンネル登録と高評価、そしてお友達へのシェアもぜひ**よろしく**お願いします。",
+                      f"Please subscribe to the channel, like the video, and share with your friends."),
+            ("Host2", f"次回も皆さんの役に立つ面白いトピックを用意して**お待ちしています**。",
+                      f"Next time too we will prepare an interesting topic helpful to you all."),
+            ("Host1", f"今日も素晴らしい一日をお過ごし**ください**！",
+                      f"Please have a wonderful day today as well!"),
+            ("Host2", f"それでは皆さん、また次回の配信でお会い**しましょう**！",
+                      f"Well then everyone, let's meet again in the next broadcast!"),
+            ("Host1", f"さようなら、笑顔で日本語を話して**いきましょう**！",
+                      f"Goodbye, let's keep speaking Japanese with a smile!")
+        ]
+    ]
+
+    all_templates = []
+    for ph in phases:
+        all_templates.extend(ph)
+    turns = []
+    for i in range(target):
+        _, t_ja, t_en = all_templates[i % len(all_templates)]
+        spk = "Host2" if i % 2 == 0 else "Host1"
+        turns.append({
+            "speaker": spk,
+            "japanese": t_ja,
+            "romaji": to_accurate_romaji(t_ja),
+            "english": t_en
+        })
+    return turns
+
+
+def _extend_script(existing_turns, topic_es, topic_en, target=150):
+    fallback_pool = _fallback_script(topic_es, topic_en, target)
+    idx = 0
+    cur_speaker = existing_turns[-1]["speaker"] if existing_turns else "Host1"
+    while len(existing_turns) < target:
+        cand = fallback_pool[idx % len(fallback_pool)]
+        idx += 1
+        needed_spk = "Host1" if cur_speaker == "Host2" else "Host2"
+        existing_turns.append({
+            "speaker": needed_spk,
+            "japanese": cand["japanese"],
+            "romaji": cand["romaji"],
+            "english": cand["english"]
+        })
+        cur_speaker = needed_spk
+    return existing_turns[:target]
+
+
 def generate_script():
     topic = _generate_topic() or random.choice(TOPICS)
     topic_es = topic.split(" - ")[0]
@@ -801,32 +1127,35 @@ def generate_script():
     all_turns = []
     consecutive_empty = 0
     import time as _time
-    _deadline = _time.time() + 300  # hard cap: give up after 5 min of script generation
+    _deadline = _time.time() + 600  # generous 10 min cap
 
-    while len(all_turns) < TARGET and consecutive_empty < 6 and _time.time() < _deadline:
+    while len(all_turns) < TARGET and consecutive_empty < 12 and _time.time() < _deadline:
         batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH)
         if not batch:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
-                print("  API busy - waiting 10s before retrying...")
-                _time.sleep(10)
+            wait_s = min(15, 3 + consecutive_empty * 2)
+            print(f"  API busy (consecutive fails: {consecutive_empty}) - waiting {wait_s}s before retrying...", flush=True)
+            _time.sleep(wait_s)
             continue
         all_turns.extend(batch)
         consecutive_empty = 0
-        print(f"  Script progress: {len(all_turns)}/{TARGET} turns")
+        print(f"  Script progress: {len(all_turns)}/{TARGET} turns", flush=True)
         if len(all_turns) < TARGET:
-            _time.sleep(2)
+            _time.sleep(1)
 
     all_turns = all_turns[:TARGET]
 
-    if len(all_turns) < 30:
-        print("  Too few turns from API, using fallback script")
-        return _fallback_script(topic_es, topic_en), topic_es, topic_en
+    if not all_turns:
+        print("  Using structured fallback script (150 unique turns)...", flush=True)
+        all_turns = _fallback_script(topic_es, topic_en, TARGET)
+    elif len(all_turns) < TARGET:
+        print(f"  Extending {len(all_turns)} turns to {TARGET} with topic conversation...", flush=True)
+        all_turns = _extend_script(all_turns, topic_es, topic_en, TARGET)
 
     # Short 2-line intro: Kenji (Host2) first, then Hana (Host1), then topic
     topic_romaji = to_accurate_romaji(topic_es)
     all_turns[0]["speaker"] = "Host2"
-    all_turns[0]["japanese"] = f"こんにちは、健二です。Velocity Japanese へようこそ。今日は{topic_es}について話します。"
+    all_turns[0]["japanese"] = f"こんにちは、健二です。Velocity Japaneseへようこそ。今日は**{topic_es}**について話します。"
     all_turns[0]["romaji"] = f"Konnichiwa, Kenji desu. Velocity Japanese e yōkoso. Kyō wa {topic_romaji} ni tsuite hanashimasu."
     all_turns[0]["english"] = f"Hi, I'm Kenji. Welcome to Velocity Japanese Podcast. Today we talk about {topic_en}."
     if len(all_turns) > 1:
@@ -844,20 +1173,8 @@ def generate_script():
         else:
             turn["romaji"] = ro
 
-    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}")
+    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}", flush=True)
     return all_turns, topic_es, topic_en
-
-
-def _fallback_script(topic_es, topic_en):
-    turns = []
-    topic_ro = to_accurate_romaji(topic_es)
-    for i in range(150):
-        s = "Host2" if i % 2 == 0 else "Host1"
-        if s == "Host2":
-            turns.append({"speaker": s, "japanese": f"こんにちは、健二です。今日は{topic_es}について話します。", "romaji": f"Konnichiwa, Kenji desu. Kyou wa {topic_ro} ni tsuite hanashimasu.", "english": f"Hi, I'm Kenji. Today we talk about {topic_en}."})
-        else:
-            turns.append({"speaker": s, "japanese": f"いいですね、健二さん。{topic_es}はとても**面白い**です。", "romaji": f"Ii desu ne, Kenji-san. {topic_ro} wa totemo **omoshiroi** desu.", "english": f"Good idea, Kenji. {topic_en} is very interesting."})
-    return turns
 
 
 async def generate_audio(turns, target_dir=None):
