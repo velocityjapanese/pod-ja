@@ -277,6 +277,28 @@ def parse_video_metadata(video_info: dict):
     return title, description
 
 
+
+def post_facebook_comment(video_id, access_token, website="https://velocityjapanese.com/"):
+    import requests
+    try:
+        comment_url = f"https://graph.facebook.com/v21.0/{video_id}/comments"
+        pinned_msg = (
+            "🇯🇵 Learn Japanese naturally with free interactive guides and vocabulary lessons!\n"
+            f"👉 Visit our website: {website}\n"
+            f"📖 Read our blog lessons: {website}blog/\n"
+            "🔔 Follow for daily Japanese podcast episodes!"
+        )
+        r = requests.post(comment_url, data={'access_token': access_token, 'message': pinned_msg}, timeout=30)
+        if r.status_code in [200, 201]:
+            c_id = r.json().get('id')
+            safe_print(f"[Facebook] Pinned comment posted: {c_id}")
+            try:
+                requests.post(f"https://graph.facebook.com/v21.0/{c_id}", data={'access_token': access_token, 'is_pinned': 'true'}, timeout=15)
+            except Exception:
+                pass
+    except Exception as e:
+        safe_print(f"[Facebook] Notice on comment post: {e}")
+
 def upload_to_facebook_page(video_path, title, description, thumbnail_path=None, page_id=None, access_token=None):
     """
     Uploads video to Facebook Page in EXACTLY ONE Meta Graph API call.
@@ -348,6 +370,7 @@ def upload_to_facebook_page(video_path, title, description, thumbnail_path=None,
                 safe_print("SUCCESS: FACEBOOK VIDEO PUBLISHED (EXACTLY 1 API CALL)!")
                 safe_print(f"[Facebook] Video ID: {video_id}")
                 safe_print(f"[Facebook] Video URL: https://www.facebook.com/{video_id}")
+                post_facebook_comment(video_id, access_token, website="https://velocityjapanese.com/")
                 safe_print("=" * 60)
                 return {
                     "success": True,

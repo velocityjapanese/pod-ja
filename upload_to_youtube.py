@@ -102,6 +102,31 @@ def upload_to_youtube():
         print(f"[youtube] Uploaded! ID: {video_id}")
         print(f"[youtube] URL: https://youtube.com/watch?v={video_id}")
 
+        # Post pinned comment to YouTube linking to website
+        try:
+            comment_text = (
+                "🇯🇵 Master Japanese naturally with free vocabulary guides, romaji breakdowns & articles!\n"
+                "👉 Visit Velocity Japanese: https://velocityjapanese.com/\n"
+                "📖 Read our latest Japanese blog lessons: https://velocityjapanese.com/blog/"
+            )
+            print("\n[youtube] Posting pinned comment to video...")
+            youtube.commentThreads().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "videoId": video_id,
+                        "topLevelComment": {
+                            "snippet": {
+                                "textOriginal": comment_text
+                            }
+                        }
+                    }
+                }
+            ).execute()
+            print("[youtube] Pinned comment posted successfully!")
+        except Exception as ce:
+            print(f"[youtube] Notice on comment post: {ce}")
+
         thumbnail_path = Path(meta.get("thumbnail_path", ""))
         print(f"[youtube] Checking thumbnail: {thumbnail_path}")
         if thumbnail_path.exists():

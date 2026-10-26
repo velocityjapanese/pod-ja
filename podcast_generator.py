@@ -1366,7 +1366,7 @@ async def main():
     description = build_podcast_description(topic_es, topic_en, len(turns), round(duration / 60, 1))
     tags = ["Learn Japanese", "Japanese", "Japanese Podcast", "Learn Japanese Naturally",
             "Japanese for Beginners", "Bilingual", "Japanese Listening", "Japanese Conversation",
-            topic_es, "Velocity Japanese"]
+            "JLPT N5", "JLPT N4", "Japanese Romaji", "Velocity Japanese", topic_es, topic_en]
 
     meta_out = {
         "title": title,
@@ -1397,32 +1397,39 @@ async def main():
 
 def build_podcast_title(topic_es, topic_en):
     titles = [
-        f"Japanese Podcast: {topic_es} | 日本語を学ぶ",
-        f"Learn Japanese: {topic_es} | Bilingual Podcast",
-        f"{topic_es} | Japanese Conversation for Beginners",
-        f"{topic_es} | Hana と Kenji と一緒に日本語を練習",
+        f"Learn Japanese: {topic_es} ({topic_en}) | Bilingual Japanese Podcast | Velocity Japanese",
+        f"Japanese Conversation for Beginners: {topic_es} | Hana & Kenji | Velocity Japanese",
+        f"Japanese Podcast: {topic_es} ({topic_en}) | A2 Listening Practice with Romaji",
+        f"{topic_es} | Speak Japanese Naturally with Hana & Kenji | Velocity Japanese",
     ]
     return random.choice(titles)
 
 
 def build_podcast_description(topic_es, topic_en, turns_count, duration_min):
     description = (
-        f"🎙️ Velocity Japanese へようこそ。Yōkoso. Podcast!\n\n"
+        f"🎙️ Velocity Japanese へようこそ。Yōkoso Podcast!\n"
+        f"👉 Free Japanese Guides & Vocabulary Blog: https://velocityjapanese.com/\n"
+        f"📖 Read our latest Japanese Articles: https://velocityjapanese.com/blog/\n\n"
         f"このエピソードでは、Hana と Kenji がについて話します。Nihongo de: {topic_es} ({topic_en}).\n"
-        f"A2レベルのリラックスしたバイリンガル会話で、日本語を自然に学べます。Romaji 付き。.\n\n"
+        f"A2レベルのリラックスしたバイリンガル会話で、日本語を自然に学べます。Romaji 付き。\n\n"
         f"✨ WHAT'S INSIDE THIS EPISODE:\n"
-        f"• {turns_count} 役立つ日本語のフレーズと表現\n"
-        f"• 日常会話の実用的な語彙\n"
-        f"• ネイティブの自然な発音\n"
-        f"• 各行に英語訳とローマ字\n\n"
+        f"• {turns_count} 役立つ日本語のフレーズと表現 (Practical Japanese phrases)\n"
+        f"• 日常会話の実用的な語彙 (Everyday conversational vocabulary)\n"
+        f"• ネイティブの自然な発音 (Natural native pronunciation)\n"
+        f"• 各行に英語訳とローマ字 (English translation and romaji on every line)\n\n"
+        f"🔍 POPULAR SEARCH QUERIES:\n"
+        f"learn japanese, japanese podcast for beginners, jlpt listening practice, japanese conversation a2, learn japanese with romaji, {topic_en.lower()} in japanese, velocity japanese podcast\n\n"
         f"📌 HOW TO USE THIS PODCAST:\n"
-        f"1️⃣ 日本語の部分を聞いて理解してみてください\n"
-        f"2️⃣ 英語の翻訳を確認してください\n"
-        f"3️⃣ フレーズを声に出して繰り返してください\n"
-        f"4️⃣ また明日聞いてください - 毎日簡単になります!\n\n"
-        f"🔔 毎日新しいレッスンを購読してください.\n\n"
+        f"1️⃣ 日本語の部分を聞いて理解してみてください (Listen to Japanese)\n"
+        f"2️⃣ 英語の翻訳を確認してください (Check English meaning)\n"
+        f"3️⃣ フレーズを声に出して繰り返してください (Repeat out loud)\n"
+        f"4️⃣ また明日聞いてください - 毎日簡単になります! (Practice daily!)\n\n"
+        f"🌐 OFFICIAL WEBSITE & BLOG:\n"
+        f"• Website: https://velocityjapanese.com/\n"
+        f"• Blog: https://velocityjapanese.com/blog/\n\n"
+        f"🔔 毎日新しいレッスンを購読してください。\n\n"
         f"📅 長さ: {duration_min} 分\n\n"
-        f"#LearnJapanese #JapanesePodcast #Bilingual #LanguageLearning"
+        f"#LearnJapanese #JapanesePodcast #Bilingual #LanguageLearning #JapaneseForBeginners #JLPT #VelocityJapanese #SpeakJapanese"
     )
     return description
 
