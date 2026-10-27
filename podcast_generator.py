@@ -1450,6 +1450,10 @@ def create_video(turns, audio_files, video_dir=None):
 
 
 async def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     print("=" * 60)
     print("  VELOCITY JAPANESE PODCAST")
     print("=" * 60)
