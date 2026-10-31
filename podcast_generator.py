@@ -55,6 +55,17 @@ WHITE = (255, 255, 255)
 LIGHT_GRAY = (170, 180, 205)
 DARK_LINE = (50, 55, 75)
 
+# Japanese subtitle layout: roomy line rhythm + visible gaps between glyphs.
+_JA_LINE_FACTOR = 1.55
+_CJK_TRACKING_RATIO = 0.06
+# Punctuation / auxiliary bits that never stand alone as a highlight step.
+_JA_PUNCT = set("。、！？「」『』（）…―〜・,.:;!?()\"' ")
+_JA_AUX_MERGE = frozenset({
+    "です", "ます", "でした", "ました", "ですか", "ますか",
+    "ですね", "ますね", "でしょう", "下さい", "ください",
+    "います", "あります", "ございます", "なさい",
+})
+
 def load_font(size, bold=False, italic=False):
     fonts_to_try = []
     if italic and bold:
@@ -269,6 +280,17 @@ def sanitize_latin(text):
     text = text.replace('\u3001', ', ').replace('\u3002', '.').replace('\u30fb', ' ')
     text = text.replace('\uff0c', ',').replace('\uff0e', '.').replace('\uff01', '!')
     text = text.replace('\uff1f', '?').replace('\uff20', '@')
+    _EXTRA_LATIN = {
+        '\u00e6': 'ae', '\u00c6': 'AE',
+        '\u00f8': 'o', '\u00d8': 'O',
+        '\u0153': 'oe', '\u0152': 'OE',
+        '\u00df': 'ss', '\u1e9e': 'SS',
+        '\u0142': 'l', '\u0141': 'L',
+        '\u0131': 'i',
+        '\u0111': 'd', '\u0110': 'D',
+        '\u00f0': 'd', '\u00d0': 'D',
+        '\u00fe': 'th', '\u00de': 'TH',
+    }
     def norm_letter(m):
         ch = m.group(0)
         if ch == '\u0101': return 'a'
@@ -289,8 +311,16 @@ def sanitize_latin(text):
         if ch == '\u00fc': return 'u'
         if ch == '\u00f6': return 'o'
         if ch == '\u00e4': return 'a'
+        if ch in _EXTRA_LATIN:
+            return _EXTRA_LATIN[ch]
+        import unicodedata as _ud
+        _base = ''.join(
+            c for c in _ud.normalize('NFKD', ch)
+            if not _ud.combining(c))
+        if _base and all(ord(c) < 128 for c in _base):
+            return _base
         return ch
-    text = re.sub(r'[\u00c0-\u024f\u0100-\u017f]', norm_letter, text)
+    text = re.sub(r'[\u00c0-\u024f\u0100-\u017f\u1e00-\u1eff]', norm_letter, text)
     text = re.sub(r'[\u3040-\u30ff\u4e00-\u9fff\uff00-\uffef\u3000-\u303f]', ' ', text)
     # final safety net: map remaining symbols to ASCII, else drop (prevents any tofu glyph)
     text = text.replace('\u2192', ' -> ').replace('\u2190', ' <- ').replace('\u2194', ' -- ')
@@ -308,15 +338,261 @@ def sanitize_latin(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def _merge_karaoke_phrases(tokens):
+    """Group raw tokens into phrase-level highlight steps (bunsetsu-style).
+
+    Particles, punctuation, auxiliaries and single-character fragments join a
+    neighboring phrase, so a highlight step spans whole words but never cuts
+    one in half. Whitespace separates phrases and is dropped (the display
+    re-adds single spaces between words).
+    """
+    # Pre-pass: very long pure-hiragana runs (beginner-style sentences the
+    # segmenter leaves whole) split at particle/auxiliary boundaries: before
+    # every cut word and also after multi-char ones, so particles detach
+    # from what follows (はりょこう must become は|りょこう, never one
+    # piece). Later passes rejoin any over-cut, so this only refines.
+    _HIRA_CUT = ("から", "まで", "より", "でした", "ました", "ません",
+                 "ましょう", "ください", "なさい", "ほしい", "みたい",
+                 "らしい", "です", "ます", "たい", "ない", "ため", "よう",
+                 "こと", "もの", "とき", "ところ", "ほう",
+                 "は", "が", "を", "に", "の", "で", "と", "へ", "も",
+                 "ね", "よ")
+    _CUT2 = "|".join(w for w in _HIRA_CUT if len(w) == 2)
+    _CUT3 = "|".join(w for w in _HIRA_CUT if len(w) == 3)
+    _cut_pat = re.compile("(?=%s)|(?<=%s)|(?<=%s)"
+                          % ("|".join(_HIRA_CUT), _CUT2, _CUT3))
+    prepped = []
+    for tok in (tokens or []):
+        if not tok or not tok.strip():
+            continue
+        if re.fullmatch(r'[ぁ-ん]{9,}', tok):
+            prepped.extend(p for p in _cut_pat.split(tok) if p)
+        else:
+            prepped.append(tok)
+    merged = []
+    for tok in prepped:
+        if merged and (tok in _JA_PUNCT or tok in _JA_AUX_MERGE):
+            merged[-1] += tok
+        else:
+            merged.append(tok)
+    # Heal mid-word cuts: fragments join neighbors so a highlight step spans
+    # whole words but never cuts one in half. Single hiragana goes backward
+    # (particles); other singles go backward except at a clause start or
+    # before a hiragana continuation (they belong forward). Short hiragana
+    # fragments chain forward (okurigana endings stay with their stem).
+    # This only ever merges, so steps may span words but never split one.
+    _SENT_END = set("。、！？!?…」』")
+    _PART1 = set("はがのをにでともへやかねよぞ")
+    _PART_PRE = ("から", "まで", "より", "だけ", "しか", "ほど",
+                 "ので", "のに", "なら", "たら", "れば", "けど", "でも",
+                 "って")
+    _VERB_END = ("ます", "です", "ました", "でした", "ません",
+                 "ますか", "ですか", "した", "して", "しない",
+                 "したい", "だった")
+
+    def _is_hira_ch(ch):
+        return 'ぁ' <= ch <= 'ん'
+
+    def _starts_particle(s):
+        return bool(s) and (s[0] in _PART1 or s.startswith(_PART_PRE))
+
+    healed = []
+    i, n = 0, len(merged)
+    while i < n:
+        tok = merged[i]
+        prev = healed[-1] if healed else None
+        nxt = merged[i + 1] if i + 1 < n else None
+        prev_end = prev[-1] if prev else ""
+        sent_start = prev is None or prev_end in _SENT_END
+
+        # Detach a leading particle so it rejoins the previous phrase
+        # (はりょこう → は|りょこう → きょうは|りょこう). Skipped when the
+        # previous phrase already ends with a particle (がくせい after は
+        # stays whole) or at a sentence start. Runs once per piece; the
+        # rest reprocesses through the normal rules below.
+        _lead = None
+        if (prev is not None and not sent_start
+                and prev_end not in _PART1 and len(tok) > 1
+                and tok not in _JA_PUNCT and tok not in _JA_AUX_MERGE):
+            if tok[0] in _PART1:
+                _lead = tok[0]
+            else:
+                for _pp in _PART_PRE:
+                    if tok.startswith(_pp) and len(tok) > len(_pp):
+                        _lead = _pp
+                        break
+        if _lead is not None:
+            healed[-1] = prev + _lead
+            merged[i] = tok[len(_lead):]
+            tok = merged[i]
+            if not tok:
+                i += 1
+                continue
+            prev = healed[-1]
+            prev_end = prev[-1] if prev else ""
+            sent_start = prev is None or prev_end in _SENT_END
+
+        if tok in _JA_PUNCT or tok in _JA_AUX_MERGE:
+            if sent_start:
+                if nxt is not None:
+                    merged[i + 1] = tok + nxt
+                    i += 1
+                    continue
+                healed.append(tok)
+                i += 1
+                continue
+            if prev is not None:
+                healed[-1] = prev + tok
+                i += 1
+                continue
+            healed.append(tok)
+            i += 1
+            continue
+        if len(tok) == 1 and n > 1:
+            if _is_hira_ch(tok):
+                if sent_start and nxt is not None and re.fullmatch(
+                        r'[ァ-ヶー]+', nxt):
+                    merged[i + 1] = tok + nxt  # loanword typo: ち + ケット
+                    i += 1
+                    continue
+                if nxt is not None and nxt.startswith(_VERB_END):
+                    merged[i + 1] = tok + nxt  # verb stem: し + ます → します
+                    i += 1
+                    continue
+                if prev is not None and not sent_start:
+                    healed[-1] = prev + tok
+                    i += 1
+                    continue
+                if nxt is not None:
+                    merged[i + 1] = tok + nxt
+                    i += 1
+                    continue
+                healed.append(tok)
+                i += 1
+                continue
+            # single kanji/katakana/latin/digit fragment
+            if sent_start:
+                if nxt is not None:
+                    merged[i + 1] = tok + nxt
+                    i += 1
+                    continue
+                healed.append(tok)
+                i += 1
+                continue
+            if nxt is not None and len(nxt) == 1 and _is_hira_ch(nxt):
+                healed.append(tok)  # let 国|に attach on に's turn
+                i += 1
+                continue
+            if nxt is not None and _starts_particle(nxt):
+                if prev is not None and prev_end not in _PART1:
+                    healed[-1] = prev + tok  # バス|停 + が… → バス停
+                else:
+                    merged[i + 1] = tok + nxt  # 駅|まで after バスで → 駅まで
+                i += 1
+                continue
+            elif nxt is not None and _is_hira_ch(nxt[0]):
+                if prev is not None and 'ぁ' <= prev_end <= 'ん':
+                    merged[i + 1] = tok + nxt  # 友|だちと → 友だちと
+                    i += 1
+                    continue
+                if prev is not None:
+                    healed[-1] = prev + tok
+                    i += 1
+                    continue
+            if prev is not None:
+                healed[-1] = prev + tok  # compound continuation: 八|時, 十五|分
+                i += 1
+                continue
+            if nxt is not None:
+                merged[i + 1] = tok + nxt
+                i += 1
+                continue
+            healed.append(tok)
+            i += 1
+            continue
+        if (re.fullmatch(r'[ぁ-ん]{1,2}', tok) is not None and nxt is not None
+                and _is_hira_ch(nxt[0])):
+            merged[i + 1] = tok + nxt  # お|か|し → おかし, 死に|たい
+            i += 1
+            continue
+        if (nxt is not None and _is_hira_ch(nxt[0])
+                and re.fullmatch(r'[一-鿿々〆]+[ぁ-ん]{1,2}', tok) is not None):
+            merged[i + 1] = tok + nxt  # 来ま|すか → 来ますか, 使え|ますが
+            i += 1
+            continue
+        healed.append(tok)
+        i += 1
+    return healed
+
+
+def japanese_display_text(japanese_text):
+    """Spaced learner display (wakachigaki): single spaces between words.
+
+    Built from the same tokens the karaoke highlighter steps through, so a
+    highlighted span is always exactly one spaced word, never half of one.
+    """
+    clean = re.sub(r'\*\*(.*?)\*\*', r'\1', japanese_text or "").strip()
+    if not clean:
+        return ""
+    return " ".join(karaoke_tokens_for_text(clean))
+
+
+def _chunk_japanese_fallback(clean):
+    """Script-run chunker used when pykakasi is unavailable.
+
+    Groups kanji with their following okurigana, plus katakana / hiragana /
+    alnum runs, so the fallback stays phrase-level instead of char-level.
+    """
+    pat = re.compile(
+        '[一-鿿々〆]+[ぁ-ん]*'
+        '|[ァ-ヶー]+'
+        '|[ぁ-ん]+'
+        '|[A-Za-z0-9]+'
+        '| +'
+        '|.'
+    )
+    return [m.group(0) for m in pat.finditer(clean)]
+
+
+def _highlight_one_cjk_word(text):
+    """Wrap a single target word of spaceless Japanese text in ** markers."""
+    plain = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    toks = [t for t in _merge_karaoke_phrases(_chunk_japanese_fallback(plain))
+            if t.strip() and t.strip() not in _JA_PUNCT]
+    content = [t for t in toks if re.search(r'[一-鿿ァ-ヶ]', t) and len(t) >= 2]
+    pool = content or [t for t in toks if len(t) >= 2] or toks
+    if not pool:
+        return text
+    pool.sort(key=len, reverse=True)
+    target = pool[0]
+    span = target
+    while len(span) > 1 and span[-1] in _JA_PUNCT:
+        span = span[:-1]
+    return plain.replace(span, "**%s**" % span, 1)
+
+
+def clean_english(text):
+    """English subtitle line must be Latin-only: CJK leaks from the model
+    render as gaps, so strip them and tidy orphaned punctuation spacing."""
+    if not text:
+        return text
+    text = sanitize_latin(text)
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def auto_highlight_japanese(text):
     if '**' in text:
         return text
+    if ' ' not in (text or "").strip() and re.search(r'[一-鿿ぁ-んァ-ヶ]', text or ""):
+        return _highlight_one_cjk_word(text)
     stopwords = {'は', 'が', 'を', 'に', 'で', 'と', 'も', 'の', 'です', 'ます', 'こと', 'これ', 'それ', '私', '僕', 'あなた'}
     words = text.split()
     candidates = []
     for idx, w in enumerate(words):
         clean_w = re.sub(r'[^\wÄÖÜäöüß]', '', w, flags=re.UNICODE)
-        if clean_w.lower() not in stopwords and len(clean_w) >= 3:
+        need = 2 if re.search(r'[一-鿿ぁ-んァ-ヶ]', clean_w) else 3
+        if clean_w.lower() not in stopwords and len(clean_w) >= need:
             candidates.append((len(clean_w), idx, w, clean_w))
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -362,6 +638,15 @@ def draw_headphones_icon(draw, center_x, center_y):
     draw.rounded_rectangle([center_x - 16, center_y - 3, center_x - 10, center_y + 11], radius=2, fill=YELLOW)
     draw.rounded_rectangle([center_x + 10, center_y - 3, center_x + 16, center_y + 11], radius=2, fill=YELLOW)
 
+def _cjk_tracking(font):
+    """Extra breathing room after each CJK glyph, scaled with font size."""
+    try:
+        size = font.size
+    except Exception:
+        size = 40
+    return max(2, int(round(size * _CJK_TRACKING_RATIO)))
+
+
 def _cjk_tokens(text, font, draw):
     """Split text into drawable tokens (char-level for CJK, word-level for latin),
     each tagged with whether it belongs to a highlighted (**) segment."""
@@ -377,22 +662,32 @@ def _cjk_tokens(text, font, draw):
         else:
             continue
         if re.search(r'[\u3000-\u30ff\u4e00-\u9fff]', part):
+            track = _cjk_tracking(font)
             for ch in part:
                 bb = draw.textbbox((0, 0), ch, font=font)
-                tokens.append((ch, is_hl, bb[2] - bb[0]))
+                tokens.append((ch, is_hl, bb[2] - bb[0] + track))
         else:
-            for w in part.split(' '):
+            # Keep every space exactly (incl. around ** runs): split while
+            # retaining separators so no gap is ever dropped or shifted.
+            for w in re.split(r'( +)', part):
                 if not w:
                     continue
-                bb = draw.textbbox((0, 0), w, font=font)
-                tokens.append((w, is_hl, bb[2] - bb[0]))
-                tokens.append((' ', False, draw.textbbox((0, 0), ' ', font=font)[2]))
-            if tokens and tokens[-1][0] == ' ':
-                tokens.pop()
+                if w.strip() == '':
+                    _sp = draw.textbbox((0, 0), ' ', font=font)[2]
+                    for _ch in w:
+                        tokens.append((' ', False, _sp))
+                else:
+                    bb = draw.textbbox((0, 0), w, font=font)
+                    tokens.append((w, is_hl, bb[2] - bb[0]))
     return tokens
 
 def _wrap_tokens(tokens, max_w):
-    """Greedy wrap tokens into visual lines that each fit max_w."""
+    """Greedy wrap tokens into visual lines that each fit max_w.
+
+    Char-level and highlight-blind on purpose: the wrapped lines are
+    identical at every highlight step (only the color changes), so the
+    subtitle layout never shifts while the highlight moves.
+    """
     lines = []
     current_line = []
     current_line_width = 0
@@ -420,6 +715,36 @@ def _wrap_tokens(tokens, max_w):
             current_line.pop()
         lines.append((current_line, current_line_width))
     return lines
+
+def wrap_text_lines(text, font, draw, max_w, keep_highlights=False):
+    """Wrap drawable tokens into exact line strings (no spacing injected).
+
+    Lines are rebuilt by concatenating token text, so spaceless Japanese
+    stays spaceless. With keep_highlights, consecutive same-color tokens
+    share one ** run.
+    """
+    tokens = _cjk_tokens(text, font, draw)
+    wrapped = _wrap_tokens(tokens, max_w)
+    lines = []
+    for line, _line_w in wrapped:
+        if keep_highlights:
+            buf = []
+            cur_txt, cur_hl = "", None
+            for w, hl, _ww in line:
+                if cur_hl is None:
+                    cur_hl, cur_txt = hl, w
+                elif hl == cur_hl:
+                    cur_txt += w
+                else:
+                    buf.append("**%s**" % cur_txt if cur_hl else cur_txt)
+                    cur_hl, cur_txt = hl, w
+            if cur_hl is not None:
+                buf.append("**%s**" % cur_txt if cur_hl else cur_txt)
+            lines.append("".join(buf))
+        else:
+            lines.append("".join(w for w, hl, _ww in line))
+    return lines
+
 
 def draw_rich_text_centered(draw, text, center_y, font, max_w=1550, line_height=90):
     text = auto_highlight_japanese(text)
@@ -563,19 +888,29 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
     DIV_Y = 615
     ZONE_BOTTOM = DIV_Y - 30
     ZONE_H = ZONE_BOTTOM - ZONE_TOP
-    japanese_text = turn.get("japanese", turn.get("spanish", ""))
+    raw_japanese = turn.get("japanese", turn.get("spanish", ""))
+    # Wakachigaki display: one space between words, built from the same
+    # tokens the karaoke steps use, so highlight == exactly one spaced word.
+    # When the line already carries ** markers (karaoke steps), keep their
+    # exact word positions: never re-tokenize + first-substring-match, which
+    # is what sent the highlight back to an earlier duplicate word.
+    if "**" in (raw_japanese or ""):
+        japanese_text = _marked_display_text(raw_japanese)
+        if not japanese_text.replace("**", "").strip():
+            japanese_text = japanese_display_text(raw_japanese)
+    else:
+        japanese_text = japanese_display_text(raw_japanese)
     romaji_text = sanitize_latin(turn.get("romaji", ""))
     if not re.search(r'[a-zA-Z]{2,}', romaji_text):
         romaji_text = to_accurate_romaji(japanese_text)
     if not re.search(r'[a-zA-Z]{2,}', romaji_text):
         romaji_text = sanitize_latin(turn.get("english", ""))
 
-    def _wrap(text, font, max_w):
-        tokens = _cjk_tokens(text, font, draw)
-        wrapped = _wrap_tokens(tokens, max_w)
-        if preserve_highlights:
-            return [' '.join((f"**{w}**" if hl else w) for w, hl, ww in line).strip() for line, wd in wrapped]
-        return [' '.join(w for w, hl, ww in line).strip() for line, wd in wrapped]
+    def _wrap(text, font, max_w, keep=False):
+        # Exact rebuild: spaceless Japanese stays spaceless (no ' ' injected
+        # between glyphs). Japanese keeps ** runs so the draw step honors the
+        # highlight word; romaji/English have no markers to keep.
+        return wrap_text_lines(text, font, draw, max_w, keep_highlights=keep)
 
     # 1) choose the largest Japanese font that wraps into <= 3 lines
     ja_font = None
@@ -583,13 +918,13 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
     final_lines = []
     for test_size in [64, 56, 48, 40, 34, 28, 24, 20]:
         tf = load_japanese_font(test_size, bold=True)
-        tl = _wrap(japanese_text, tf, 1550)
+        tl = _wrap(japanese_text, tf, 1550, keep=True)
         if len(tl) <= 3:
             ja_font, ja_size, final_lines = tf, test_size, tl
             break
     if ja_font is None:
         ja_font, ja_size = load_japanese_font(20, bold=True), 20
-        all_lines = _wrap(japanese_text, ja_font, 1550)
+        all_lines = _wrap(japanese_text, ja_font, 1550, keep=True)
         final_lines = all_lines[:3]
         if len(all_lines) > 3 and japanese_text:
             final_lines[-1] = final_lines[-1].rstrip() + "..."
@@ -601,7 +936,7 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
     ro_lines = _wrap(romaji_text, ro_font, 1350) if romaji_text else []
     n_ro = len(ro_lines)
 
-    JA_RO_GAP = 58
+    JA_RO_GAP = 72
     SAFE_BOTTOM = ZONE_BOTTOM - 6
 
     def _measure_block():
@@ -609,7 +944,7 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
         Mirrors the real draw path so measured ink is exactly what appears."""
         tmp = Image.new('RGB', (VIDEO_WIDTH, VIDEO_HEIGHT), DARK_BG)
         td = ImageDraw.Draw(tmp)
-        ja_lh_ = int(ja_size * 1.4)
+        ja_lh_ = int(ja_size * _JA_LINE_FACTOR)
         ja_center = ZONE_TOP + len(final_lines) * ja_lh_ // 2
         _, ja_ib = draw_rich_text_centered(td, " ".join(final_lines),
                                            center_y=ja_center, font=ja_font,
@@ -626,7 +961,7 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
 
     # 3) dynamically shrink BOTH fonts until the MEASURED ink block stays
     #    clear of the center divider (real ink, not just estimated line-h).
-    ja_lh = int(ja_size * 1.4)
+    ja_lh = int(ja_size * _JA_LINE_FACTOR)
     ro_lh = int(ro_size * 1.3)
     while True:
         ja_center, ro_center, ink_bottom = _measure_block()
@@ -636,11 +971,11 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
         ro_size = max(18, ro_size - 1)
         ja_font = load_japanese_font(ja_size, bold=True)
         ro_font = load_font(ro_size, bold=False, italic=True)
-        final_lines = _wrap(japanese_text, ja_font, 1550)
+        final_lines = _wrap(japanese_text, ja_font, 1550, keep=True)
         n_ja = len(final_lines)
         ro_lines = _wrap(romaji_text, ro_font, 1350) if romaji_text else []
         n_ro = len(ro_lines)
-        ja_lh = int(ja_size * 1.4)
+        ja_lh = int(ja_size * _JA_LINE_FACTOR)
         ro_lh = int(ro_size * 1.3)
 
     ja_center, ro_center, _ = _measure_block()
@@ -656,7 +991,7 @@ def create_frame(turn, output_path, frame_num=0, preserve_highlights=False):
     draw.ellipse([(VIDEO_WIDTH//2 - 8, div_y - 8), (VIDEO_WIDTH//2 + 8, div_y + 8)], fill=YELLOW)
 
     # === ENGLISH TRANSLATION (ITALIC, WRAPPED) ===
-    english_text = sanitize_latin(turn.get("english", ""))
+    english_text = clean_english(turn.get("english", ""))
     draw_english_translation(draw, english_text, center_y=715, font=f_english, max_w=1350, line_height=48)
 
     # === BOTTOM FOOTER ===
@@ -743,24 +1078,49 @@ def parse_turns_json(content, target_key="japanese"):
 
     return recovered
 
-def _fetch_turns_batch(topic, topic_es, topic_en, start_turn, batch_size=10):
-    """Fetch one small batch of turns with multi-model fallback and robust parsing."""
-    current_host = "Host2" if start_turn % 2 == 0 else "Host1"
-    next_host = "Host1" if current_host == "Host2" else "Host2"
-    host_role = "Kenji" if current_host == "Host2" else "Hana"
+def _format_history_block(history, max_turns=6):
+    """Compact recent turns for the batch prompt (speaker + English + Japanese)."""
+    lines = []
+    for turn in (history or [])[-max_turns:]:
+        if not isinstance(turn, dict):
+            continue
+        speaker = turn.get("speaker", "?")
+        role = "Kenji" if speaker == "Host2" else "Hana"
+        en = clean_text(turn.get("english", ""))
+        ja = clean_text(re.sub(r'\*\*(.*?)\*\*', r'\1', turn.get("japanese", "")))
+        lines.append(f"{role} ({speaker}): EN: {en} / JA: {ja}")
+    return "\n".join(lines)
 
+
+def _build_batch_prompt(topic, topic_es, topic_en, start_turn, batch_size,
+                        current_host, next_host, host_role, history=None):
+    """Prompt for one batch. Later batches get the recent dialogue plus
+    continuity rules so every turn responds to the previous one instead of
+    re-opening the conversation."""
+    history_block = _format_history_block(history)
     intro_instruction = ""
     if start_turn == 0:
         intro_instruction = ("IMPORTANT: This is the FIRST batch. Keep the introduction SHORT - just 2 lines total "
                              "(one from Kenji/Host2, one from Hana/Host1), then immediately dive into the topic. "
                              "No long welcome speeches.\n")
-    elif start_turn < 4:
+    elif history_block:
+        intro_instruction = ("IMPORTANT: This is a CONTINUATION. The conversation below is already in progress. "
+                             "The first new turn MUST directly respond to the last line above: answer its question, "
+                             "react with an opinion or feeling, then ask a follow-up question. "
+                             "Do NOT greet, introduce yourself, welcome anyone, or restate the topic. "
+                             "Keep ONE evolving thread: every turn answers or reacts to the previous turn, "
+                             "never two disconnected monologues.\n")
+    else:
         intro_instruction = "Continue naturally into the topic conversation. No new introductions.\n"
 
-    prompt = f"""You are writing a Japanese/English learning podcast at A2 level with romaji.
+    history_section = ""
+    if history_block:
+        history_section = (f"Previous conversation (respond directly to the LAST line):\n{history_block}\n\n")
+
+    return f"""You are writing a Japanese/English learning podcast at A2 level with romaji.
 Topic: {topic}
 
-The dialogue so far is at turn {start_turn}. The current speaker is {host_role} ({current_host}).
+{history_section}The dialogue so far is at turn {start_turn}. The current speaker is {host_role} ({current_host}).
 Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {current_host}.
 
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
@@ -774,6 +1134,16 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "japanese": "...", "romaji": "...", "english": "..."}},
  {{"speaker": "{next_host}", "japanese": "...", "romaji": "...", "english": "..."}}]"""
 
+
+def _fetch_turns_batch(topic, topic_es, topic_en, start_turn, batch_size=10, history=None):
+    """Fetch one small batch of turns with multi-model fallback and robust parsing."""
+    current_host = "Host2" if start_turn % 2 == 0 else "Host1"
+    next_host = "Host1" if current_host == "Host2" else "Host2"
+    host_role = "Kenji" if current_host == "Host2" else "Hana"
+
+    prompt = _build_batch_prompt(topic, topic_es, topic_en, start_turn, batch_size,
+                                 current_host, next_host, host_role, history)
+
     candidate_models = [AI_MODEL, "openai", "mistral", "qwen"]
     models_to_try = []
     for mod in candidate_models:
@@ -785,7 +1155,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). The romaji field must contain ONLY Latin letters Hepburn transliteration. English belongs only in the english field. Output single compact JSON array without unescaped newlines inside strings."},
+                    {"role": "system", "content": "You write natural A2-level Japanese podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Hana and Kenji strictly alternate. Every turn directly responds to the previous turn: answers, reactions, follow-up questions. No greetings or topic restatements mid-dialogue. Highlight 1 key target word per turn in double asterisks like **tango**. No filler sounds. CRITICAL: the japanese field must contain ONLY Japanese script (hiragana/katakana/kanji). The romaji field must contain ONLY Latin letters Hepburn transliteration. English belongs only in the english field. Output single compact JSON array without unescaped newlines inside strings."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.8
@@ -806,11 +1176,12 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
                     continue
                 if not re.search(r'[a-zA-Z]{2,}', ro):
                     ro = to_accurate_romaji(ja)
+                en_clean = clean_english(en)
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
                     "japanese": clean_text(ja),
                     "romaji": ro,
-                    "english": clean_text(en) if en else "Translation unavailable"
+                    "english": en_clean if en_clean else "Translation unavailable"
                 })
             if len(valid) >= 4:
                 return valid
@@ -1132,7 +1503,7 @@ def generate_script():
     _deadline = _time.time() + 600  # generous 10 min cap
 
     while len(all_turns) < TARGET and consecutive_empty < 12 and _time.time() < _deadline:
-        batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH)
+        batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH, history=all_turns)
         if not batch:
             consecutive_empty += 1
             wait_s = min(15, 3 + consecutive_empty * 2)
@@ -1166,7 +1537,8 @@ def generate_script():
         all_turns[1]["romaji"] = f"Arigatō, Kenji-san. Kyō no tēma wa totemo **omoshiroi** desu. Hajimemashō."
         all_turns[1]["english"] = f"Thanks, Kenji. Today's topic is very interesting. Let's start."
 
-    # Final guarantee across ALL turns: ensure valid Latin romaji exists for every single turn
+    # Final guarantee across ALL turns: valid Latin romaji and CJK-free
+    # English for every single turn.
     for turn in all_turns:
         ja = turn.get("japanese", "")
         ro = sanitize_latin(turn.get("romaji", ""))
@@ -1174,6 +1546,7 @@ def generate_script():
             turn["romaji"] = to_accurate_romaji(ja)
         else:
             turn["romaji"] = ro
+        turn["english"] = clean_english(turn.get("english", "")) or "Translation unavailable"
 
     print(f"  Script: {len(all_turns)} turns, topic: {topic_es}", flush=True)
     return all_turns, topic_es, topic_en
@@ -1239,27 +1612,151 @@ async def generate_audio(turns, target_dir=None):
             print(f"  Audio {i} [{turn['speaker']}/{voice}] via {engine}: {duration:.1f}s, {len(word_boundaries)} bounds")
     return audio_files
 
-def karaoke_tokens_for_text(japanese_text):
-    """Split a Japanese line into per-word highlight tokens."""
+_KARAOKE_SEP = " "
+# Joiner between karaoke highlight steps. Japanese renders wakachigaki
+# (one space between words), so steps join with " " and the highlight
+# always covers exactly one spaced word.
+
+
+def _karaoke_marked(tokens, k):
+    """Rebuild the karaoke line with token k highlighted, preserving spacing.
+
+    The highlighted token keeps its exact position, so the wrapped subtitle
+    lines are identical at every step: only the color changes, the layout
+    never shifts. Pure-space tokens are never wrapped in markers.
+    """
+    return _KARAOKE_SEP.join(
+        f"**{x}**" if (j == k and x.strip() != "") else x
+        for j, x in enumerate(tokens))
+
+
+def _marked_display_text(raw_japanese):
+    """Spaced display for a **-marked line, without re-tokenizing.
+
+    The marked runs keep their exact word positions (index-based), so the
+    highlight always lands on the intended word: never the first duplicate
+    of a repeated word, never half a word, never a vanished highlight.
+    Re-tokenizing here (a different segmentation than the karaoke steps
+    use) plus first-substring-match is what made the highlight jump back
+    to an earlier word. Unmarked parts split on whitespace; step lines
+    are already space-joined tokens, so they round-trip exactly.
+    """
+    parts = re.split(r'(\*\*.+?\*\*)', raw_japanese or "")
+    words, hl = [], set()
+    for p in parts:
+        if len(p) >= 4 and p.startswith("**") and p.endswith("**"):
+            for w in p[2:-2].split():
+                hl.add(len(words))
+                words.append(w)
+        else:
+            words.extend(p.split())
+    return " ".join("**%s**" % w if i in hl else w
+                    for i, w in enumerate(words))
+
+
+def _boundary_tokens_and_spans(clean, boundaries):
+    """Align Edge TTS word boundaries to the text: (token texts, spans).
+
+    Returns (None, None) when alignment fails. Skipped characters between
+    boundaries (punctuation the engine does not emit, e.g. 。、) attach to
+    the preceding token, so joining the tokens rebuilds the text exactly.
+    """
+    items = [(b.get("text", ""), b) for b in (boundaries or []) if b.get("text")]
+    if not items or not clean:
+        return None, None
+    out, spans, pos = [], [], 0
+    for t, b in items:
+        raw = t
+        i = clean.find(raw, pos)
+        if i < 0:
+            return None, None
+        if i > pos:
+            gap = clean[pos:i]
+            if out:
+                out[-1] += gap
+            else:
+                t = gap + raw
+        try:
+            start = float(b.get("offset", 0))
+            end = start + float(b.get("duration", 0))
+        except (TypeError, ValueError):
+            return None, None
+        out.append(t)
+        spans.append([start, end])
+        pos = i + len(raw)
+    if pos < len(clean):
+        if not out:
+            return None, None
+        out[-1] += clean[pos:]
+    return out, spans
+
+
+def _spans_for_tokens(tokens, aligned, spans):
+    """Map merged tokens back onto aligned boundary spans.
+
+    Merge only concatenates whole adjacent pieces, so greedy prefix-chopping
+    always succeeds; returns None on any surprise (caller splits evenly).
+    """
+    res, j = [], 0
+    for tok in tokens:
+        rest, s, e = tok, None, None
+        while rest:
+            if j >= len(aligned):
+                return None
+            p, (ps, pe) = aligned[j], spans[j]
+            if rest == p or rest.startswith(p):
+                s = ps if s is None else s
+                e = pe
+                rest = rest[len(p):]
+                j += 1
+            else:
+                return None
+        res.append([s, e])
+    return res
+
+
+def karaoke_tokens_for_text(japanese_text, boundaries=None):
+    """Split a Japanese line into per-word highlight tokens.
+
+    Edge TTS word boundaries are the primary segmentation (the engine's own
+    words, exactly what gets spoken); pykakasi and the script-run chunker
+    are fallbacks. Grouped into phrase steps in all cases.
+    """
     clean = re.sub(r'\*\*(.*?)\*\*', r'\1', japanese_text or "").strip()
     if not clean:
         return []
+    if boundaries:
+        aligned, _spans = _boundary_tokens_and_spans(clean, boundaries)
+        if aligned is not None and "".join(aligned) == clean:
+            return _merge_karaoke_phrases(aligned)
     if _kakasi_inst is not None:
         try:
             res = _kakasi_inst.convert(clean)
             toks = [d.get("orig", "") for d in res if d.get("orig")]
             if toks and "".join(toks).replace(" ", "") == clean.replace(" ", ""):
-                return toks
+                return _merge_karaoke_phrases(toks)
         except Exception:
             pass
-    return list(clean)
+    return _merge_karaoke_phrases(_chunk_japanese_fallback(clean))
 
 
-def karaoke_step_durations(tokens, duration, boundaries):
-    """Per-token seconds: real Edge timings when counts match, else even split."""
+def karaoke_step_durations(tokens, duration, boundaries, japanese_text=None):
+    """Per-token seconds: exact Edge spans when they map to tokens, else split."""
     n = len(tokens)
     if n == 0:
         return []
+    if boundaries and japanese_text:
+        clean = re.sub(r'\*\*(.*?)\*\*', r'\1', japanese_text or "").strip()
+        aligned, spans = _boundary_tokens_and_spans(clean, boundaries)
+        if (aligned is not None and "".join(aligned) == clean
+                and _merge_karaoke_phrases(aligned) == tokens):
+            mapped = _spans_for_tokens(tokens, aligned, spans)
+            if mapped is not None:
+                total = sum(e - s for s, e in mapped) or duration
+                durs = [(e - s) * duration / total for s, e in mapped]
+                durs = [max(0.12, d) for d in durs]
+                scale = duration / sum(durs)
+                return [d * scale for d in durs]
     if boundaries and len(boundaries) == n:
         total = sum(b["duration"] for b in boundaries) or duration
         durs = [b["duration"] * duration / total for b in boundaries]
@@ -1285,8 +1782,9 @@ def write_karaoke_files(turns, audio_files, out_dir):
     timings = []
     for turn, audio in zip(turns, audio_files):
         dur = audio["duration"]
-        tokens = karaoke_tokens_for_text(turn.get("japanese", ""))
-        steps = karaoke_step_durations(tokens, dur, audio.get("word_boundaries", []))
+        bounds = audio.get("word_boundaries", [])
+        tokens = karaoke_tokens_for_text(turn.get("japanese", ""), bounds)
+        steps = karaoke_step_durations(tokens, dur, bounds, turn.get("japanese", ""))
         cursor = t
         cells = []
         for tok, d in zip(tokens, steps):
@@ -1294,7 +1792,7 @@ def write_karaoke_files(turns, audio_files, out_dir):
             cursor += d
         timings.append({"speaker": turn["speaker"], "tokens": cells})
         if tokens:
-            k_line = "".join("{\\k%d}%s" % (max(1, int(round(d * 100))), tok) for tok, d in zip(tokens, steps))
+            k_line = _KARAOKE_SEP.join("{\\k%d}%s" % (max(1, int(round(d * 100))), tok) for tok, d in zip(tokens, steps))
             events.append(f"Dialogue: 0,{_ass_timestamp(t)},{_ass_timestamp(t + dur)},JP,,0,0,0,,{k_line}")
         romaji = sanitize_latin(turn.get("romaji", ""))
         if romaji:
@@ -1321,13 +1819,14 @@ def render_karaoke_preview(turns, audio_files, out_dir, max_turns=3):
     for ti in range(min(max_turns, len(turns))):
         turn = turns[ti]
         audio = audio_files[ti]
-        tokens = karaoke_tokens_for_text(turn.get("japanese", ""))
+        bounds = audio.get("word_boundaries", [])
+        tokens = karaoke_tokens_for_text(turn.get("japanese", ""), bounds)
         if not tokens:
             continue
-        steps = karaoke_step_durations(tokens, audio["duration"], audio.get("word_boundaries", []))
+        steps = karaoke_step_durations(tokens, audio["duration"], bounds, turn.get("japanese", ""))
         parts = []
         for k in range(len(tokens)):
-            marked = "".join(f"**{x}**" if j == k else x for j, x in enumerate(tokens))
+            marked = _karaoke_marked(tokens, k)
             step_turn = dict(turn)
             step_turn["japanese"] = marked
             img = prev_dir / f"t{ti:02d}_w{k:03d}.png"
@@ -1361,8 +1860,9 @@ def render_karaoke_preview(turns, audio_files, out_dir, max_turns=3):
 def _render_turn_segment(turn, audio, video_dir, i):
     """One video segment per turn with burnt-in per-word karaoke highlight."""
     video_dir = Path(video_dir)
-    tokens = karaoke_tokens_for_text(turn.get("japanese", ""))
-    steps = karaoke_step_durations(tokens, audio["duration"], audio.get("word_boundaries", []))
+    bounds = audio.get("word_boundaries", [])
+    tokens = karaoke_tokens_for_text(turn.get("japanese", ""), bounds)
+    steps = karaoke_step_durations(tokens, audio["duration"], bounds, turn.get("japanese", ""))
     if not tokens:
         img = video_dir / f"f_{i:04d}.png"
         create_frame(turn, str(img), i)
@@ -1370,7 +1870,7 @@ def _render_turn_segment(turn, audio, video_dir, i):
     else:
         parts = []
         for k in range(len(tokens)):
-            marked = "".join(f"**{x}**" if j == k else x for j, x in enumerate(tokens))
+            marked = _karaoke_marked(tokens, k)
             step_turn = dict(turn)
             step_turn["japanese"] = marked
             img = video_dir / f"f_{i:04d}_w{k:03d}.png"
